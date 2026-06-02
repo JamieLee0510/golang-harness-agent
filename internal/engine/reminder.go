@@ -9,20 +9,20 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
 
-// ReminderInjector 於 runtime 監控上下文，在模型陷入執念（重複失敗）時動態注入強力打斷訊息。
+// ReminderInjector monitors the context at runtime and dynamically injects a strong interrupting message when the model falls into a fixation (repeated failures).
 type ReminderInjector struct {
-	// consecutiveFailures 以工具呼叫指紋（hash(ToolName + Arguments)）為鍵，記錄連續失敗次數。
+	// consecutiveFailures records the consecutive failure count, keyed by the tool call fingerprint (hash(ToolName + Arguments)).
 	consecutiveFailures map[string]int
 }
 
-// NewReminderInjector 建立 ReminderInjector。
+// NewReminderInjector builds a ReminderInjector.
 func NewReminderInjector() *ReminderInjector {
 	return &ReminderInjector{
 		consecutiveFailures: make(map[string]int),
 	}
 }
 
-// generateFingerprint 產生工具呼叫的唯一指紋，用於判斷模型是否在重複相同的動作。
+// generateFingerprint produces a unique fingerprint for a tool call, used to determine whether the model is repeating the same action.
 func generateFingerprint(toolName string, args []byte) string {
 	hasher := md5.New()
 	hasher.Write([]byte(toolName))
@@ -30,25 +30,25 @@ func generateFingerprint(toolName string, args []byte) string {
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-// CheckAndInject 分析本輪執行結果，決定是否在上下文尾端追加 Reminder。
-// 同一指紋連續失敗超過 3 次時，回傳一條 RoleUser 訊息（最高近因效應權重）強制模型改變策略；
-// 工具一旦成功則清空所有失敗計數；其餘情況回傳 nil。
+// CheckAndInject analyzes this turn's execution result and decides whether to append a Reminder at the tail of the context.
+// When the same fingerprint fails more than 3 times consecutively, it returns a RoleUser message (highest recency-effect weight) to force the model to change strategy;
+// once a tool succeeds it clears all failure counts; in all other cases it returns nil.
 func (r *ReminderInjector) CheckAndInject(lastToolCall schema.ToolCall, lastResult schema.ToolResult) *schema.Message {
 	fingerpring := generateFingerprint(lastToolCall.Name, lastToolCall.Arguments)
 
-	// 工具執行成功代表此路徑走通了，清空所有失敗計數器。
+	// A successful tool execution means this path worked, so clear all failure counters.
 	if !lastResult.IsError {
 		r.consecutiveFailures = make(map[string]int)
 		return nil
 	}
 
-	// 執行失敗則累加該指紋的失敗次數。
+	// On execution failure, increment the failure count for this fingerprint.
 	r.consecutiveFailures[fingerpring]++
 	failCount := r.consecutiveFailures[fingerpring]
 
-	// 死迴圈打斷機制：連續 3 次在同一處跌倒，強行打斷模型的局部執念。
+	// Dead-loop interruption mechanism: tripping on the same spot 3 times in a row forcibly breaks the model's local fixation.
 	if failCount > 3 {
-		log.Println("[Reminder] ⚠️ 觸發死迴圈干預！注入強力修正指令。")
+		log.Println("[Reminder] ⚠️ dead-loop intervention triggered! Injecting strong corrective instructions.")
 
 		nudgeMsg := fmt.Sprintf(`[SYSTEM REMINDER 警告]
 你似乎陷入了死迴圈。你剛剛連續 %d 次使用相同的參數呼叫了 '%s' 工具，並且都失敗了。
@@ -60,7 +60,7 @@ func (r *ReminderInjector) CheckAndInject(lastToolCall schema.ToolCall, lastResu
 `, failCount, lastToolCall.Name)
 
 		return &schema.Message{
-			Role:    schema.RoleUser, // 必須是 RoleUser，確保在下一次 API 請求中擁有最高的近因效應權重
+			Role:    schema.RoleUser, // Must be RoleUser to ensure the highest recency-effect weight in the next API request
 			Content: nudgeMsg,
 		}
 	}

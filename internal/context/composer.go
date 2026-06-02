@@ -8,14 +8,14 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
 
-// PromptComposer 依工作區動態組裝 System Prompt（核心紀律、Plan Mode、AGENTS.md、Skills）。
+// PromptComposer dynamically assembles the System Prompt based on the workspace (core discipline, Plan Mode, AGENTS.md, Skills).
 type PromptComposer struct {
 	workDir     string
 	planMode    bool
 	skillLoader *SkillLoder
 }
 
-// NewPromptComposer 建立 PromptComposer。
+// NewPromptComposer creates a PromptComposer.
 func NewPromptComposer(workDir string, planMode bool) *PromptComposer {
 	return &PromptComposer{
 		workDir:     workDir,
@@ -24,11 +24,11 @@ func NewPromptComposer(workDir string, planMode bool) *PromptComposer {
 	}
 }
 
-// Build 組裝並回傳一條 System 訊息。
+// Build assembles and returns a single System message.
 func (c *PromptComposer) Build() schema.Message {
 	var promptBuilder strings.Builder
 
-	// 1. 核心身分與最底線的紅線紀律。
+	// 1. Core identity and the bottom-line red-line discipline.
 	promptBuilder.WriteString(`# 核心身份
 		你名叫 golang-harness-agent，一個由駕馭工程驅動的骨灰級研發助手。
 		你具備極簡主義哲學，拒絕廢話。你能透過系統提供的內建工具，建立、讀取、修改和執行工作區中的程式碼。
@@ -42,7 +42,7 @@ func (c *PromptComposer) Build() schema.Message {
 		6. 始終用繁體中文回覆，以便傳達你的進展和想法。
 		`)
 
-	// 2. Plan Mode：強制將架構思路與執行進度外部化到實體檔案。
+	// 2. Plan Mode: force externalizing architectural thinking and execution progress into physical files.
 	if c.planMode {
 		promptBuilder.WriteString(`
 # 長程任務與狀態外部化強制規範 (Plan Mode: ON)
@@ -66,7 +66,7 @@ func (c *PromptComposer) Build() schema.Message {
 			`)
 	}
 
-	// 3. 外部化狀態：載入專案專屬規範（AGENTS.md）。
+	// 3. Externalized state: load project-specific conventions (AGENTS.md).
 	agentsMDPath := filepath.Join(c.workDir, "AGENTS.md")
 	content, err := os.ReadFile(agentsMDPath)
 	if err == nil {
@@ -77,7 +77,7 @@ func (c *PromptComposer) Build() schema.Message {
 		promptBuilder.WriteString("\n```\n")
 	}
 
-	// 4. 動態載入 Skills。
+	// 4. Dynamically load Skills.
 	skillsContent := c.skillLoader.LoadAll()
 	if skillsContent != "" {
 		promptBuilder.WriteString(skillsContent)

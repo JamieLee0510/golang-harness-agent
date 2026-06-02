@@ -9,45 +9,45 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
 
-// MiddlewareFunc 是工具執行前的攔截器簽名。
-// 回傳 allowed 表示是否放行，rejectReason 為攔截時要回傳給模型的原因。
+// MiddlewareFunc is the signature for an interceptor that runs before a tool executes.
+// The returned allowed indicates whether to permit execution, and rejectReason is the reason returned to the model when intercepted.
 type MiddlewareFunc func(ctx context.Context, call schema.ToolCall) (allowed bool, rejectReason string)
 
-// BaseTool 是所有工具都需實作的通用介面。
+// BaseTool is the common interface that all tools must implement.
 type BaseTool interface {
-	// Name 回傳全域唯一的工具名（模型以此名稱呼叫工具）。
+	// Name returns the globally unique tool name (the model calls the tool by this name).
 	Name() string
 
-	// Definition 回傳提交給模型的元資料與參數 JSON schema。
+	// Definition returns the metadata and parameter JSON schema submitted to the model.
 	Definition() schema.ToolDefinition
 
-	// Execute 接收模型輸出的 JSON 參數，執行實際的功能邏輯。
+	// Execute receives the JSON parameters output by the model and executes the actual functional logic.
 	Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
-// Registry 管理工具的註冊、中間件掛載與路由執行。
+// Registry manages tool registration, middleware mounting, and routed execution.
 type Registry interface {
-	// Register 向系統掛載一個新工具。
+	// Register mounts a new tool into the system.
 	Register(tool BaseTool)
 
-	// Use 掛載一個全域中間件。
+	// Use mounts a global middleware.
 	Use(mw MiddlewareFunc)
 
-	// GetAvailableTools 回傳所有已掛載工具的 schema，供主迴圈提交給 Provider。
+	// GetAvailableTools returns the schemas of all mounted tools for the main loop to submit to the Provider.
 	GetAvailableTools() []schema.ToolDefinition
 
-	// Execute 路由並執行模型請求的工具呼叫。
+	// Execute routes and executes the tool call requested by the model.
 	Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult
 }
 
-// registryImpl 是 Registry 的預設實作。
+// registryImpl is the default implementation of Registry.
 type registryImpl struct {
-	// tools 以工具名為鍵，提供 O(1) 路由查找。
+	// tools is keyed by tool name, providing O(1) route lookup.
 	tools       map[string]BaseTool
 	middlewares []MiddlewareFunc
 }
 
-// NewRegistry 建立一個空的 Registry。
+// NewRegistry creates an empty Registry.
 func NewRegistry() Registry {
 	return &registryImpl{
 		tools:       make(map[string]BaseTool),
@@ -77,7 +77,7 @@ func (r *registryImpl) GetAvailableTools() []schema.ToolDefinition {
 }
 
 func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
-	// 1. 路由查找；找不到通常代表模型幻覺出不存在的工具。
+	// 1. Route lookup; not found usually means the model hallucinated a nonexistent tool.
 	tool, exists := r.tools[call.Name]
 	if !exists {
 		errMsg := fmt.Sprintf("Error: the tool '%s' doesn't exist in system", call.Name)
@@ -88,23 +88,23 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 		}
 	}
 
-	// 2. 執行工具前，依序通過所有中間件做安全把關。
+	// 2. Before executing the tool, pass through all middlewares in order for security gatekeeping.
 	for _, mw := range r.middlewares {
 		allowed, rejectReason := mw(ctx, call)
 		if !allowed {
-			log.Printf("[Registry] ⚠️ 工具 %s 被 Middleware 攔截: %s\n", call.Name, rejectReason)
+			log.Printf("[Registry] ⚠️ Tool %s intercepted by Middleware: %s\n", call.Name, rejectReason)
 			return schema.ToolResult{
 				ToolCallId: call.ID,
-				Output:     fmt.Sprintf("執行被系統攔截。原因: %s", rejectReason),
+				Output:     fmt.Sprintf("Execution intercepted by the system. Reason: %s", rejectReason),
 				IsError:    true,
 			}
 		}
 	}
 
-	// 3. 執行工具。
+	// 3. Execute the tool.
 	output, err := tool.Execute(ctx, call.Arguments)
 
-	// 4. 封裝結果回傳給主迴圈。
+	// 4. Wrap the result and return it to the main loop.
 	if err != nil {
 		errMsg := fmt.Sprintf("Error executing %s: %v", call.Name, err)
 		return schema.ToolResult{ToolCallId: call.ID, Output: errMsg, IsError: true}

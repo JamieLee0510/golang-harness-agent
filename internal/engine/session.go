@@ -7,7 +7,7 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
 
-// Session 保存單一會話的完整對話歷史（使用者輸入、模型回覆、工具結果）。
+// Session holds the complete conversation history of a single session (user input, model replies, tool results).
 type Session struct {
 	ID        string
 	WorkDir   string
@@ -15,10 +15,10 @@ type Session struct {
 	UpdatedAt time.Time
 
 	history []schema.Message
-	mu      sync.RWMutex // 防止併發讀寫 history 造成 data race
+	mu      sync.RWMutex // prevents data races from concurrent reads/writes of history
 }
 
-// NewSession 建立一個空的 Session。
+// NewSession builds an empty Session.
 func NewSession(id string, workDir string) *Session {
 	return &Session{
 		ID:        id,
@@ -29,10 +29,10 @@ func NewSession(id string, workDir string) *Session {
 	}
 }
 
-// Append 以線程安全的方式向 Session 追加一條或多條訊息。
+// Append appends one or more messages to the Session in a thread-safe manner.
 //
-// 持久化預留點：工業級實作（如 Claude Code）會在此將 history 以 JSONL 形式
-// 追加寫入 workDir/.claw/sessions/xxx.jsonl。
+// Persistence placeholder: an industrial-grade implementation (like Claude Code) would here append
+// the history in JSONL form to workDir/.claw/sessions/xxx.jsonl.
 func (s *Session) Append(msgs ...schema.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -41,12 +41,12 @@ func (s *Session) Append(msgs ...schema.Message) {
 	s.UpdatedAt = time.Now()
 }
 
-// GetWorkingMemory 從歷史尾端截取最近的 limit 條訊息，形成 Agent 的短期工作記憶；
-// limit <= 0 或歷史不足時回傳全量（皆為深拷貝，避免外部修改）。
+// GetWorkingMemory takes the most recent limit messages from the tail of the history to form the Agent's short-term working memory;
+// when limit <= 0 or the history is insufficient it returns the full set (all deep copies, to prevent external modification).
 //
-// 大模型 API 要求歷史訊息連續：若截斷後的首條是「孤兒」工具回應
-// （RoleUser 且含 ToolCallId，但對應的 ToolCall 已被截掉）會回 400，
-// 因此這裡會將開頭的孤兒工具回應逐一捨棄，順延到下一條正常訊息。
+// The LLM API requires history messages to be contiguous: if the first message after truncation is an "orphan" tool response
+// (RoleUser with a ToolCallId, but whose corresponding ToolCall has been truncated away) the API returns 400,
+// so this discards leading orphan tool responses one by one, advancing to the next normal message.
 func (s *Session) GetWorkingMemory(limit int) []schema.Message {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -71,18 +71,18 @@ func (s *Session) GetWorkingMemory(limit int) []schema.Message {
 	return res
 }
 
-// SessionManager 管理多會話，用於多使用者／多終端隔離。
+// SessionManager manages multiple sessions, used for multi-user / multi-terminal isolation.
 type SessionManager struct {
 	sessions map[string]*Session
 	mu       sync.RWMutex
 }
 
-// GlobalSessionMgr 是全域共享的會話管理器。
+// GlobalSessionMgr is the globally shared session manager.
 var GlobalSessionMgr = &SessionManager{
 	sessions: make(map[string]*Session),
 }
 
-// GetOrCreate 依 id 取得既有 Session，不存在則建立一個新的。
+// GetOrCreate returns the existing Session for the given id, or creates a new one if it does not exist.
 func (sm *SessionManager) GetOrCreate(id string, workDir string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()

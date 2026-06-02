@@ -13,118 +13,118 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/agentctx"
 )
 
-// approvalTimeout 是人類審批的最長等待時間。
-// 飛書原版沒有逾時，但 Telegram 場景下若使用者一直不回覆，工具 Goroutine 會永久阻塞造成洩漏，
-// 因此這裡加上保護：逾時即視為拒絕，釋放被掛起的引擎協程。
+// approvalTimeout is the maximum time to wait for human approval.
+// The original Feishu version had no timeout, but in the Telegram scenario, if the user never replies the tool Goroutine would block forever and leak,
+// so we add a safeguard here: timeout is treated as rejection, releasing the suspended engine goroutine.
 const approvalTimeout = 5 * time.Minute
 
-// ApprovalResult 審批結果包
+// ApprovalResult is the approval result bundle
 type ApprovalResult struct {
 	Allowed bool
 	Reason  string
 }
 
-// ApprovalManager 統一管理當前正在等待人類審批的任務。
+// ApprovalManager centrally manages tasks currently awaiting human approval.
 type ApprovalManager struct {
 	mu sync.RWMutex
-	// pendingTasks 以審批單號 TaskID 為鍵，值為接收審批結果的 channel。
+	// pendingTasks is keyed by the approval ticket TaskID, with the value being the channel that receives the approval result.
 	pendingTasks map[string]chan ApprovalResult
 }
 
-// GlobalApprovalMgr 是全域單例，供 Registry 中間件與 Telegram 訊息處理器共享狀態。
+// GlobalApprovalMgr is a global singleton that lets the Registry middleware and the Telegram message handler share state.
 var GlobalApprovalMgr = &ApprovalManager{
 	pendingTasks: make(map[string]chan ApprovalResult),
 }
 
-// taskCounter 用於產生短、好打字、且不會碰撞的 TaskID（使用者要在聊天室裡手動輸入）
+// taskCounter is used to generate short, easy-to-type, collision-free TaskIDs (the user must enter them manually in the chat)
 var taskCounter atomic.Uint64
 
-// NextTaskID 產生一個短審批單號（T1、T2…）。
-// 不用模型的 ToolCallID 當單號，是因為 Telegram 要使用者「手打」approve <id>，
-// 而 ToolCallID（如 call_x7Vz3ab…）太長不利輸入。
+// NextTaskID generates a short approval ticket number (T1, T2…).
+// We don't use the model's ToolCallID as the ticket number because Telegram requires the user to "type" approve <id> by hand,
+// and a ToolCallID (e.g. call_x7Vz3ab…) is too long to be convenient to enter.
 func NextTaskID() string {
 	return fmt.Sprintf("T%d", taskCounter.Add(1))
 }
 
-// Reporter 透過 context 往下傳遞：每個 chatID 各有一個 *TelegramReporter，
-// 隨 context 傳給中間件與 SubAgent，才能把訊息送回發起呼叫的那個聊天室。
-// 底層 context key 放在中性套件 agentctx，讓 tools 套件也能讀到，
-// 避免 telegram → engine → tools 的 import 循環。
+// The Reporter is passed down through the context: each chatID has its own *TelegramReporter,
+// carried along the context to the middleware and SubAgent so messages can be sent back to the chat that initiated the call.
+// The underlying context key lives in the neutral agentctx package so the tools package can read it too,
+// avoiding the telegram → engine → tools import cycle.
 
-// WithReporter 在進入引擎前，把該會話的 reporter 塞進 context。
+// WithReporter injects the session's reporter into the context before entering the engine.
 func WithReporter(ctx context.Context, r *TelegramReporter) context.Context {
 	return agentctx.WithReporter(ctx, r)
 }
 
-// ReporterFromCtx 從 context 取出 reporter；CLI/終端機模式下取不到會回傳 nil。
-// 中間件閉包（在 main.go）靠它拿到「發起該次工具呼叫的那個聊天室」的 reporter，
-// 全程無共享可變狀態，多聊天室並發也不會串台。
+// ReporterFromCtx extracts the reporter from the context; returns nil in CLI/terminal mode where it isn't present.
+// The middleware closure (in main.go) relies on it to obtain the reporter for "the chat that initiated this tool call",
+// with no shared mutable state throughout, so concurrent chats won't cross wires.
 func ReporterFromCtx(ctx context.Context) *TelegramReporter {
 	r, _ := agentctx.ReporterFromCtx(ctx).(*TelegramReporter)
 	return r
 }
 
-// WaitForApproval 發送 Telegram 通知，並阻塞當前協程等待回覆結果
+// WaitForApproval sends a Telegram notification and blocks the current goroutine while waiting for the reply result
 func (m *ApprovalManager) WaitForApproval(ctx context.Context, taskID, toolName, args string, reporter *TelegramReporter) (bool, string) {
-	// 1. 建立用於阻塞當前引擎協程的 channel（容量 1，防止 ResolveApproval 端死鎖）
+	// 1. Create the channel used to block the current engine goroutine (capacity 1, to prevent deadlock on the ResolveApproval side)
 	ch := make(chan ApprovalResult, 1)
 
 	m.mu.Lock()
 	m.pendingTasks[taskID] = ch
 	m.mu.Unlock()
 
-	// 確保任何路徑離開時都清理掉 pending 記錄，避免記憶體洩漏
+	// Ensure the pending record is cleaned up on any exit path to avoid memory leaks
 	defer func() {
 		m.mu.Lock()
 		delete(m.pendingTasks, taskID)
 		m.mu.Unlock()
 	}()
 
-	// 2. 透過 Reporter 向 Telegram 發送審批請求
-	noticeMsg := fmt.Sprintf(`⚠️ 高危操作審批請求
-Agent 試圖執行以下動作：
-- 工具：%s
-- 參數：%s
+	// 2. Send the approval request to Telegram via the Reporter
+	noticeMsg := fmt.Sprintf(`⚠️ High-risk operation approval request
+The Agent is attempting to perform the following action:
+- Tool: %s
+- Args: %s
 
-任務 ID：%s
+Task ID: %s
 
-👉 請直接回覆「approve %s」放行，或「reject %s」拒絕。`,
+👉 Please reply "approve %s" to allow, or "reject %s" to reject.`,
 		toolName, args, taskID, taskID, taskID)
 
 	if reporter != nil {
 		reporter.sendMsg(noticeMsg)
 	} else {
-		// 回退到終端機列印（相容本機 CLI 模式）
-		fmt.Printf("\n\033[31m[需要審批 TaskID: %s]\033[0m %s\n", taskID, noticeMsg)
+		// Fall back to terminal printing (compatible with local CLI mode)
+		fmt.Printf("\n\033[31m[Approval required, TaskID: %s]\033[0m %s\n", taskID, noticeMsg)
 	}
 
-	log.Printf("[Approval] 已發送審批請求 (TaskID: %s)，協程掛起等待...\n", taskID)
+	log.Printf("[Approval] Approval request sent (TaskID: %s), goroutine suspended and waiting...\n", taskID)
 
-	// 3. 阻塞等待 Telegram 訊息處理器喚醒；逾時或會話取消則自動拒絕。
+	// 3. Block waiting for the Telegram message handler to wake us up; on timeout or session cancellation, auto-reject.
 	select {
 	case result := <-ch:
 		return result.Allowed, result.Reason
 	case <-time.After(approvalTimeout):
-		log.Printf("[Approval] TaskID %s 審批逾時（%s），自動拒絕\n", taskID, approvalTimeout)
+		log.Printf("[Approval] TaskID %s approval timed out (%s), automatically rejected\n", taskID, approvalTimeout)
 		if reporter != nil {
-			reporter.sendMsg(fmt.Sprintf("⏰ 任務 %s 審批逾時，已自動拒絕。", taskID))
+			reporter.sendMsg(fmt.Sprintf("⏰ Task %s approval timed out and has been automatically rejected.", taskID))
 		}
-		return false, fmt.Sprintf("審批逾時（超過 %s 未回覆），基於安全預設自動拒絕。", approvalTimeout)
+		return false, fmt.Sprintf("Approval timed out (no reply within %s); automatically rejected based on the safe default.", approvalTimeout)
 	case <-ctx.Done():
-		// 會話被取消（例如使用者 Ctrl+C）時，乾淨退出
-		return false, "會話已取消，操作中止。"
+		// When the session is cancelled (e.g. the user presses Ctrl+C), exit cleanly
+		return false, "Session cancelled; operation aborted."
 	}
 }
 
-// ResolveApproval 由 Telegram 訊息處理器觸發，向 channel 發送信號解開阻塞
+// ResolveApproval is triggered by the Telegram message handler, sending a signal to the channel to unblock
 func (m *ApprovalManager) ResolveApproval(taskID string, allowed bool, reason string) bool {
 	m.mu.RLock()
 	ch, exists := m.pendingTasks[taskID]
 	m.mu.RUnlock()
 
 	if exists {
-		log.Printf("[Approval] 收到 Telegram 審批結果 (TaskID: %s, Allowed: %v)\n", taskID, allowed)
-		// channel 容量為 1，這裡不會阻塞；用 select+default 多一層保險防止重複回覆時 panic
+		log.Printf("[Approval] Received Telegram approval result (TaskID: %s, Allowed: %v)\n", taskID, allowed)
+		// The channel has capacity 1, so this won't block; use select+default as an extra safeguard against panic on duplicate replies
 		select {
 		case ch <- ApprovalResult{Allowed: allowed, Reason: reason}:
 		default:
@@ -132,15 +132,15 @@ func (m *ApprovalManager) ResolveApproval(taskID string, allowed bool, reason st
 		return true
 	}
 
-	log.Printf("[Approval] 找不到對應的 TaskID: %s，可能已逾時或處理完畢\n", taskID)
+	log.Printf("[Approval] No matching TaskID found: %s, it may have timed out or already been processed\n", taskID)
 	return false
 }
 
-// approvalReplyRe 解析「approve T12」/「reject T12」這類回覆（大小寫不敏感、容忍前後空白）
+// approvalReplyRe parses replies like "approve T12" / "reject T12" (case-insensitive, tolerant of leading/trailing whitespace)
 var approvalReplyRe = regexp.MustCompile(`(?i)^\s*(approve|reject)\s+(\S+)\s*$`)
 
-// ParseApprovalReply 嘗試把一句聊天訊息解讀成審批指令。
-// 回傳 (taskID, allowed, ok)；ok 為 false 表示這不是審批指令，應走正常 Agent 流程。
+// ParseApprovalReply attempts to interpret a chat message as an approval command.
+// Returns (taskID, allowed, ok); ok being false means this is not an approval command and should go through the normal Agent flow.
 func ParseApprovalReply(text string) (taskID string, allowed bool, ok bool) {
 	m := approvalReplyRe.FindStringSubmatch(text)
 	if m == nil {
@@ -149,30 +149,30 @@ func ParseApprovalReply(text string) (taskID string, allowed bool, ok bool) {
 	return m[2], strings.EqualFold(m[1], "approve"), true
 }
 
-// IsDangerousCommand 用簡單的黑名單判斷該工具呼叫是否需要人類審批
+// IsDangerousCommand uses a simple blacklist to decide whether a tool call needs human approval
 func IsDangerousCommand(toolName, args string) bool {
-	// 對於純讀取的工具，預設 YOLO 模式，全部放行
+	// For read-only tools, default to YOLO mode and let everything through
 	if toolName != "bash" && toolName != "write_file" && toolName != "edit_file" {
 		return false
 	}
 
-	// 針對 bash 的高危模式比對
+	// Match against high-risk patterns for bash
 	if toolName == "bash" {
 		dangerousPatterns := []string{
-			`rm\s+-r`, // 級聯刪除
-			`sudo\s+`, // 提權
-			`drop\s+`, // 資料庫刪除
-			`>.*\.go`, // 惡意覆寫原始碼
+			`rm\s+-r`, // cascading deletion
+			`sudo\s+`, // privilege escalation
+			`drop\s+`, // database deletion
+			`>.*\.go`, // malicious overwrite of source code
 		}
 		for _, p := range dangerousPatterns {
 			if matched, _ := regexp.MatchString(p, args); matched {
 				return true
 			}
 		}
-		// 其餘 bash 指令暫不攔截（與飛書原版一致）
+		// Other bash commands are not intercepted for now (consistent with the original Feishu version)
 		return false
 	}
 
-	// write_file / edit_file 一律視為高危（會改動磁碟），需要人類確認
+	// write_file / edit_file are always treated as high-risk (they modify disk) and require human confirmation
 	return true
 }

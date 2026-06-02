@@ -14,38 +14,38 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
 
-// TelegramBot 封裝 Telegram 機器人的配置與核心業務流。
+// TelegramBot wraps the Telegram bot's configuration and core business flow.
 type TelegramBot struct {
 	b      *bot.Bot
 	engine *engine.AgentEngine
 }
 
-// NewTelegramBot 從環境變數 TELEGRAM_BOT_TOKEN 讀取憑證並建立 TelegramBot。
+// NewTelegramBot reads the credential from the TELEGRAM_BOT_TOKEN environment variable and creates a TelegramBot.
 func NewTelegramBot(eng *engine.AgentEngine) *TelegramBot {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" {
-		log.Fatal("請設定 TELEGRAM_BOT_TOKEN（向 @BotFather 申請）")
+		log.Fatal("Please set TELEGRAM_BOT_TOKEN (request one from @BotFather)")
 	}
 
 	tb := &TelegramBot{engine: eng}
 
 	b, err := bot.New(token, bot.WithDefaultHandler(tb.defaultHandler))
 	if err != nil {
-		log.Fatalf("Telegram Bot 初始化失敗: %v", err)
+		log.Fatalf("Telegram Bot initialization failed: %v", err)
 	}
 	tb.b = b
 
 	return tb
 }
 
-// Start 啟動長輪詢，阻塞直到 ctx 被取消。
-// 不像 Feishu 需要外掛 HTTP server，Telegram bot 自行管理 polling loop。
+// Start launches long polling and blocks until ctx is cancelled.
+// Unlike Feishu, which needs a separate HTTP server, the Telegram bot manages its own polling loop.
 func (b *TelegramBot) Start(ctx context.Context) {
-	log.Printf("[Telegram] 開始監聽訊息...")
+	log.Printf("[Telegram] Started listening for messages...")
 	b.b.Start(ctx)
 }
 
-// defaultHandler 是所有未匹配特定指令的訊息入口。
+// defaultHandler is the entry point for all messages that don't match a specific command.
 func (b *TelegramBot) defaultHandler(ctx context.Context, _ *bot.Bot, update *models.Update) {
 	if update.Message == nil || update.Message.Text == "" {
 		return
@@ -53,88 +53,88 @@ func (b *TelegramBot) defaultHandler(ctx context.Context, _ *bot.Bot, update *mo
 
 	chatID := update.Message.Chat.ID
 	text := update.Message.Text
-	log.Printf("[Telegram] 收到會話 %d 訊息: %s", chatID, text)
+	log.Printf("[Telegram] Received message from chat %d: %s", chatID, text)
 
-	// 先判斷這句是不是審批回覆（approve/reject <TaskID>）。
-	// 若是，喚醒對應的被掛起工具協程，而非開啟一輪新的 Agent 推理。
+	// First determine whether this message is an approval reply (approve/reject <TaskID>).
+	// If so, wake up the corresponding suspended tool goroutine instead of starting a new round of Agent reasoning.
 	if taskID, allowed, ok := ParseApprovalReply(text); ok {
 		reporter := &TelegramReporter{b: b.b, chatID: chatID}
-		if GlobalApprovalMgr.ResolveApproval(taskID, allowed, "人類於 Telegram 做出決定") {
+		if GlobalApprovalMgr.ResolveApproval(taskID, allowed, "Human made a decision via Telegram") {
 			if allowed {
-				reporter.sendMsg(fmt.Sprintf("✅ 已放行任務 %s。", taskID))
+				reporter.sendMsg(fmt.Sprintf("✅ Approved task %s.", taskID))
 			} else {
-				reporter.sendMsg(fmt.Sprintf("⛔ 已拒絕任務 %s。", taskID))
+				reporter.sendMsg(fmt.Sprintf("⛔ Rejected task %s.", taskID))
 			}
 		} else {
-			reporter.sendMsg(fmt.Sprintf("⚠️ 找不到任務 %s（可能已逾時或處理完畢）。", taskID))
+			reporter.sendMsg(fmt.Sprintf("⚠️ Task %s not found (it may have timed out or already been processed).", taskID))
 		}
 		return
 	}
 
-	// 每條訊息獨立 goroutine，避免長任務阻塞下一條。
+	// Each message gets its own goroutine, so a long task doesn't block the next one.
 	go b.handleAgentRun(chatID, text)
 }
 
-// handleAgentRun 連接 Telegram 與底層引擎：建立會話、注入 reporter，並執行一輪 Agent。
+// handleAgentRun connects Telegram with the underlying engine: creates the session, injects the reporter, and runs one round of the Agent.
 func (b *TelegramBot) handleAgentRun(chatID int64, prompt string) {
 	reporter := &TelegramReporter{
 		b:      b.b,
 		chatID: chatID,
 	}
 
-	// 以 chatID 為 key 維持每個會話獨立的對話歷史
+	// Use chatID as the key to keep a separate conversation history per session
 	workDir, _ := os.Getwd()
 	workDir += "/workspace"
 	session := engine.GlobalSessionMgr.GetOrCreate(strconv.FormatInt(chatID, 10), workDir)
 
-	// Run 只負責讀取 working memory，所以必須先把使用者輸入追加成一條 user 訊息
+	// Run only reads working memory, so we must first append the user input as a user message
 	session.Append(schema.Message{
 		Role:    schema.RoleUser,
 		Content: prompt,
 	})
 
-	// 把該會話的 reporter 注入 context，讓審批中間件與 SubAgent 能把訊息送回這個 chatID。
+	// Inject this session's reporter into the context so the approval middleware and SubAgent can send messages back to this chatID.
 	ctx := WithReporter(context.Background(), reporter)
 	err := b.engine.Run(ctx, session, reporter)
 	if err != nil {
-		reporter.sendMsg(fmt.Sprintf("❌ Agent 執行崩潰: %v", err))
+		reporter.sendMsg(fmt.Sprintf("❌ Agent execution crashed: %v", err))
 	}
 }
 
-// TelegramReporter 將引擎輸出格式化後發送到指定 chatID。
+// TelegramReporter formats engine output and sends it to a specified chatID.
 type TelegramReporter struct {
 	b      *bot.Bot
 	chatID int64
 }
 
-// sendMsg 以純文字發送訊息，避免 Markdown 解析失敗導致整條訊息發不出去。
-// Telegram 的 MarkdownV2 對 . _ * [ ( 等字元要求嚴格跳脫，錯一個就 400；
-// 工具輸出常含路徑與特殊符號，純文字最穩。若需排版，可改用 ParseMode = "HTML"
-// 並把內容包成 <b>...</b> / <code>...</code>，HTML 模式的跳脫需求較小。
+// sendMsg sends messages as plain text, avoiding Markdown parse failures that would prevent the whole message from being sent.
+// Telegram's MarkdownV2 requires strict escaping of characters like . _ * [ ( ; one mistake yields a 400;
+// tool output often contains paths and special symbols, so plain text is the most reliable. For formatting, switch to ParseMode = "HTML"
+// and wrap content in <b>...</b> / <code>...</code>, since HTML mode has lighter escaping requirements.
 func (r *TelegramReporter) sendMsg(text string) {
 	_, err := r.b.SendMessage(context.Background(), &bot.SendMessageParams{
 		ChatID: r.chatID,
 		Text:   text,
 	})
 	if err != nil {
-		log.Printf("[Telegram] 發送訊息失敗: %v", err)
+		log.Printf("[Telegram] Failed to send message: %v", err)
 	}
 }
 
 func (r *TelegramReporter) OnThinking(ctx context.Context) {
-	r.sendMsg("🤔 模型正在慢思考 (Thinking)...")
+	r.sendMsg("🤔 Model is thinking...")
 }
 
 func (r *TelegramReporter) OnToolCall(ctx context.Context, toolName string, args string) {
-	r.sendMsg(fmt.Sprintf("🛠️ 正在執行工具: %s\n參數: %s", toolName, args))
+	r.sendMsg(fmt.Sprintf("🛠️ Executing tool: %s\nArgs: %s", toolName, args))
 }
 
 func (r *TelegramReporter) OnToolResult(ctx context.Context, toolName string, result string, isError bool) {
 	if isError {
-		r.sendMsg(fmt.Sprintf("⚠️ 執行報錯 (%s):\n%s", toolName, result))
+		r.sendMsg(fmt.Sprintf("⚠️ Execution error (%s):\n%s", toolName, result))
 	} else {
-		// 成功時僅彙報成功，不刷全量日誌，避免 Telegram 單條 4096 字元上限被打爆
-		r.sendMsg(fmt.Sprintf("✅ 執行成功 (%s)", toolName))
+		// On success, only report success rather than dumping the full log, to avoid blowing past Telegram's 4096-character per-message limit
+		r.sendMsg(fmt.Sprintf("✅ Execution succeeded (%s)", toolName))
 	}
 }
 
@@ -142,5 +142,5 @@ func (r *TelegramReporter) OnMessage(ctx context.Context, content string) {
 	r.sendMsg(content)
 }
 
-// 編譯時類型檢查：確保 TelegramReporter 實作了 Reporter 介面
+// Compile-time type check: ensures TelegramReporter implements the Reporter interface
 var _ engine.Reporter = (*TelegramReporter)(nil)

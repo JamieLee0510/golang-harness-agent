@@ -12,7 +12,7 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/tools"
 )
 
-// AgentEngine 驅動 ReAct 主迴圈，串接 Provider、工具註冊表、上下文壓縮與自癒機制。
+// AgentEngine drives the ReAct main loop, wiring together the Provider, tool registry, context compaction and self-healing mechanisms.
 type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
@@ -23,8 +23,8 @@ type AgentEngine struct {
 	injector       *ReminderInjector
 }
 
-// NewAgentEngine 建立 AgentEngine。compactor 的水位線設為 3000 字元、保護最近 6 條訊息
-// （約兩輪 Turn 的互動），以便在小上下文視窗下也能觀察壓縮行為。
+// NewAgentEngine builds an AgentEngine. The compactor's watermark is set to 3000 characters and protects the most recent 6 messages
+// (roughly two turns of interaction), so compaction behavior can be observed even within a small context window.
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking bool, planMode bool) *AgentEngine {
 	return &AgentEngine{
 		provider:       p,
@@ -37,13 +37,13 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 	}
 }
 
-// Run 喚醒指定 session 並執行 ReAct 主迴圈，直到模型不再請求工具為止。
-// reporter 可為 nil（純後端模式），此時略過所有進度回報。
+// Run wakes the specified session and executes the ReAct main loop until the model no longer requests tools.
+// reporter may be nil (pure backend mode), in which case all progress reporting is skipped.
 func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Reporter) error {
 	log.Printf("[Engine] awake session [%s], and lock workspace: %s\n", session.ID, session.WorkDir)
 
-	// 動態組裝 System Prompt：每個 session 綁定自己的 WorkDir，
-	// composer 依此載入該專案的 AGENTS.md 與 skills。
+	// Dynamically assemble the System Prompt: each session is bound to its own WorkDir,
+	// and the composer loads that project's AGENTS.md and skills accordingly.
 	composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
 	systemMsg := composer.Build()
 
@@ -55,17 +55,17 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 
 		availableTools := e.registry.GetAvailableTools()
 
-		// 從 Session 取出近期的 Working Memory（最近 20 條，給壓縮器留下足夠的判斷空間）。
+		// Pull recent Working Memory from the Session (the latest 20 messages, leaving the compactor enough room to make decisions).
 		workingMemory := session.GetWorkingMemory(20)
 
 		var contextHistory []schema.Message
 		contextHistory = append(contextHistory, systemMsg)
 		contextHistory = append(contextHistory, workingMemory...)
 
-		// 推理前先過一遍壓縮器：總字元數超標時，早期日誌會被遮罩、超大日誌會被掐頭去尾。
+		// Run through the compactor before inference: when total character count exceeds the limit, early logs are masked and oversized logs are trimmed at both ends.
 		compactedContext := e.compactor.Compact(contextHistory)
 
-		// Phase 1：思考階段。剝奪工具，強制模型先規劃。
+		// Phase 1: thinking stage. Strip tools to force the model to plan first.
 		if e.EnableThinking {
 			log.Printf("[Enging][Phase 1] deprivate tools and force to thinking stage")
 			if reporter != nil {
@@ -76,7 +76,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 				return fmt.Errorf("Thinking stage failed: %w", err)
 			}
 
-			// 若模型輸出了思考內容，持久化為一條 Assistant 訊息，並併入本輪臨時上下文供 Action 階段使用。
+			// If the model produced thinking content, persist it as an Assistant message and merge it into this turn's temporary context for the Action stage to use.
 			if thinkResp.Content != "" {
 				fmt.Printf("[internal thinking trace]: %s\n", thinkResp.Content)
 				session.Append(*thinkResp)
@@ -84,7 +84,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 			}
 		}
 
-		// Phase 2：行動階段。恢復工具，等待模型依規劃發起動作。
+		// Phase 2: action stage. Restore tools and wait for the model to act according to its plan.
 		log.Printf("[Enging][Phase 2] recover tools and wait for model actions")
 		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
 		if err != nil {
@@ -99,7 +99,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 			fmt.Printf("Model: %s\n", actionResp.Content)
 		}
 
-		// 終止條件：模型不再請求工具，代表任務完成。
+		// Termination condition: the model no longer requests tools, meaning the task is complete.
 		if len(actionResp.ToolCalls) == 0 {
 			log.Printf("[Engine] finish task, break the loop.")
 			break
@@ -107,23 +107,23 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 
 		log.Printf("[Engine] model request to execute %d tools ... \n", len(actionResp.ToolCalls))
 
-		// 併發執行工具呼叫（目前皆為讀寫混合，靠 registry 內的中間件把關）。
-		// 預分配固定長度的切片，每個 goroutine 只寫自己的索引，因此無需 Mutex。
+		// Execute tool calls concurrently (currently all read/write mixed, gated by middleware inside the registry).
+		// Preallocate a fixed-length slice so each goroutine only writes its own index, avoiding the need for a Mutex.
 		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
 		var wg sync.WaitGroup
 
-		// 收集本輪最後一個工具供 Reminder 探測器分析；多工具併發時這裡簡化為取第一個（idx == 0）。
+		// Collect this turn's last tool for the Reminder detector to analyze; with multiple concurrent tools this is simplified to taking the first (idx == 0).
 		var lastToolCall schema.ToolCall
 		var lastToolResult schema.ToolResult
 
 		for i, toolCall := range actionResp.ToolCalls {
 			wg.Add(1)
 
-			// 將 idx 與 call 作為參數傳入，避免閉包變數捕獲陷阱。
+			// Pass idx and call as arguments to avoid the closure variable capture trap.
 			go func(idx int, call schema.ToolCall) {
 				defer wg.Done()
 
-				log.Printf(" --> [GO-%d] 觸發並行執行: %s\n", idx, call.Name)
+				log.Printf(" --> [GO-%d] triggered parallel execution: %s\n", idx, call.Name)
 
 				if reporter != nil {
 					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
@@ -131,20 +131,20 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 
 				result := e.registry.Execute(ctx, call)
 
-				// 執行出錯時，交由 RecoveryManager 診斷並注入修正建議。
+				// On execution error, hand off to the RecoveryManager to diagnose and inject corrective suggestions.
 				finalOutput := result.Output
 				if result.IsError {
 					finalOutput = e.recovery.AnalyzeAndInject(call.Name, result.Output)
-					log.Printf(" -> [Go-%d] ❌ 注入救援指南: %s\n", idx, finalOutput)
+					log.Printf(" -> [Go-%d] ❌ injected rescue guide: %s\n", idx, finalOutput)
 				} else {
-					log.Printf(" -> [Go-%d] ✅ 工具執行成功 (返回 %d 字節)\n", idx, len(result.Output))
+					log.Printf(" -> [Go-%d] ✅ tool executed successfully (returned %d bytes)\n", idx, len(result.Output))
 				}
 
 				if reporter != nil {
-					// 回報給人類時截斷顯示，避免過長訊息；送回模型的 observationMsgs 仍為完整資料。
+					// Truncate the display when reporting to humans to avoid overly long messages; the observationMsgs sent back to the model still contain the full data.
 					displayOutput := result.Output
 					if len(displayOutput) > 200 {
-						displayOutput = displayOutput[:200] + "... (已截斷)"
+						displayOutput = displayOutput[:200] + "... (truncated)"
 					}
 					reporter.OnToolResult(ctx, call.Name, displayOutput, result.IsError)
 				}
@@ -162,15 +162,15 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 			}(i, toolCall)
 		}
 
-		// 阻塞等待所有併發工具執行完畢。
+		// Block and wait for all concurrent tools to finish executing.
 		wg.Wait()
-		log.Printf("[Engine]: 所有併發執行完畢，開始聚合觀察結果（Observation）...")
+		log.Printf("[Engine]: all concurrent executions finished, aggregating observations...")
 
-		// 將所有工具執行結果持久化到 Session，開啟下一輪推理。
+		// Persist all tool execution results to the Session, starting the next round of inference.
 		session.Append(observationMsgs...)
 
-		// 若觸發干預規則，將提醒作為 User 訊息追加到 Session 尾端，
-		// 讓模型下一輪第一眼就看到，藉此打破局部執念。
+		// If an intervention rule triggers, append the reminder as a User message at the tail of the Session,
+		// so the model sees it first thing next turn, thereby breaking its local fixation.
 		reminderMsg := e.injector.CheckAndInject(lastToolCall, lastToolResult)
 		if reminderMsg != nil {
 			session.Append(*reminderMsg)
@@ -179,11 +179,11 @@ func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Report
 	return nil
 }
 
-// RunSub 拉起一個物理隔離的子智能體迴圈，只提供 readOnlyRegistry（唯讀工具），
-// 探索完畢後回傳一段精煉摘要。reporter 為 any，由本函式斷言回 Reporter 後使用；
-// 為 nil 時略過進度回報。
+// RunSub spins up a physically isolated subagent loop, providing only the readOnlyRegistry (read-only tools),
+// and returns a refined summary once exploration is complete. reporter is an any, asserted back to Reporter by this function before use;
+// when nil, progress reporting is skipped.
 func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyRegistry tools.Registry, reporter any) (string, error) {
-	// 子智能體容易偷懶，System Prompt 必須嚴格要求它依靠工具求證。
+	// Subagents tend to be lazy, so the System Prompt must strictly require it to verify via tools.
 	contextHistory := []schema.Message{
 		{
 			Role: schema.RoleSystem,
@@ -208,23 +208,23 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 	for {
 		turnCount++
 		if turnCount > maxSubTurns {
-			return "", fmt.Errorf("子智能體探索過於深入，超過 %d 輪被強制召回，請主 Agent 給它更明確的指令", maxSubTurns)
+			return "", fmt.Errorf("subagent explored too deeply and was force-recalled after exceeding %d turns; please have the main Agent give it clearer instructions", maxSubTurns)
 		}
 
-		// 子智能體僅能取用傳入的唯讀工具註冊表。
+		// The subagent can only access the read-only tool registry passed in.
 		availableTools := readOnlyRegistry.GetAvailableTools()
 
 		compactedContext := e.compactor.Compact(contextHistory)
 
-		// 子任務要求快速回應，強制關閉慢思考，直接預測行動。
+		// Subtasks require fast responses, so slow thinking is forcibly disabled and actions are predicted directly.
 		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
 		if err != nil {
-			return "", fmt.Errorf("子智能體推理失敗: %w", err)
+			return "", fmt.Errorf("subagent inference failed: %w", err)
 		}
 
 		contextHistory = append(contextHistory, *actionResp)
 
-		// 退出條件：子智能體不再呼叫工具，代表它已完成總結匯報。
+		// Exit condition: the subagent no longer calls tools, meaning it has finished its summary report.
 		if len(actionResp.ToolCalls) == 0 {
 			return actionResp.Content, nil
 		}
@@ -237,7 +237,7 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 			go func(idx int, call schema.ToolCall) {
 				defer wg.Done()
 
-				// 讓終端使用者看到子智能體正在做什麼。
+				// Let the terminal user see what the subagent is doing.
 				var r Reporter
 				if reporter != nil {
 					r = reporter.(Reporter)
@@ -254,7 +254,7 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 				if reporter != nil {
 					display := finalOutput
 					if len(display) > 200 {
-						display = display[:200] + "... (已截斷)"
+						display = display[:200] + "... (truncated)"
 					}
 					r.OnToolResult(ctx, fmt.Sprintf("[Subagent] %s", call.Name), display, result.IsError)
 				}

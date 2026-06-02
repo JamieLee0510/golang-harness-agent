@@ -46,7 +46,7 @@ func (s *SkillLoder) LoadAll() string {
 			if err != nil {
 				skill := parseSkillMD(string(content))
 
-				// 將解析後的 skill 按結構注入
+				// Inject the parsed skill in structured form
 				skillsBuilder.WriteString(fmt.Sprintf("### 技能名稱： %s\n", skill.Name))
 				skillsBuilder.WriteString(fmt.Sprintf("**觸發條件**: %s\n\n", skill.Description))
 				skillsBuilder.WriteString("**執行指南**:\n")
@@ -69,14 +69,14 @@ func parseSkillMD(content string) Skill {
 		Description: "No description provided",
 		Body:        content, // default whole content as body
 	}
-	// 簡單解析 YAML Frontmatter (以 --- 包裹)
+	// Simple parsing of the YAML Frontmatter (wrapped by ---)
 	if strings.HasPrefix(content, "---\n") || strings.HasPrefix(content, "---\r\n") {
 		parts := strings.SplitN(content, "---", 3)
 		if len(parts) == 3 {
 			frontmatter := parts[1]
 			skill.Body = strings.TrimSpace(parts[2])
 
-			// 逐行提取 metadata
+			// Extract metadata line by line
 			lines := strings.Split(frontmatter, "\n")
 			for _, line := range lines {
 				line = strings.TrimSpace(line)
