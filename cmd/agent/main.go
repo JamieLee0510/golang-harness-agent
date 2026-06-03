@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/JamieLee0510/go-agent-harness/internal/agentctx"
 	"github.com/JamieLee0510/go-agent-harness/internal/engine"
 	"github.com/JamieLee0510/go-agent-harness/internal/provider"
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
@@ -15,68 +19,95 @@ import (
 )
 
 func main() {
+	// Two mutually exclusive modes: default Telegram bot, or -p one-shot CLI run.
+	printMode := flag.Bool("p", false, "run one task non-interactively and exit")
+	workdirFlag := flag.String("workdir", "", "sandbox directory (default: ./workspace)")
+	flag.Parse()
+
 	if os.Getenv("OPENAI_API_KEY") == "" {
 		log.Fatal("please set OPENAI_API_KEY in .env first")
 	}
 
-	workDir, _ := os.Getwd()
-	workDir += "/workspace"
+	workDir := *workdirFlag
+	if workDir == "" {
+		cwd, _ := os.Getwd()
+		workDir = cwd + "/workspace"
+	}
 
+	if *printMode {
+		runPrint(workDir, strings.TrimSpace(strings.Join(flag.Args(), " ")))
+		return
+	}
+	runTelegram(workDir)
+}
+
+// buildEngine wires the provider, tools and sub-agent shared by both modes.
+// interactive adds the human-in-the-loop approval middleware, which belongs to
+// the interactive front-end and is wired only when that front-end runs.
+func buildEngine(workDir string, interactive bool) *engine.AgentEngine {
 	llmProvider := provider.NewOpenAIProvider("gpt-5-nano")
 
-	// Defensive sandbox: prepare a restricted read-only registry for the subagent.
+	// Read-only registry for the subagent (grep/read only).
 	readOnlyRegistry := tools.NewRegistry()
 	readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
-	readOnlyRegistry.Register(tools.NewBashTool(workDir)) // allow simple search operations such as grep
+	readOnlyRegistry.Register(tools.NewBashTool(workDir))
 
 	registry := tools.NewRegistry()
-
-	// mount minimal tool set
 	registry.Register(tools.NewReadFileTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
 	registry.Register(tools.NewBashTool(workDir))
 	registry.Register(tools.NewEditFileTool(workDir))
 
-	// [Core injection] Register the security interception Middleware (human-in-the-loop)
-	// Same closure structure as the Feishu version; the difference lies in two trade-offs for the Telegram scenario:
-	//   1. reporter is taken from ctx (telegram.ReporterFromCtx) rather than a single field bound to the bot,
-	//      so that with "one bot, multiple concurrent chat rooms" the approval card won't be sent to the wrong person.
-	//   2. taskID uses a short code (telegram.NextTaskID) rather than the model's call.ID, because the user has to type approve <id> manually.
-	registry.Use(func(ctx context.Context, call schema.ToolCall) (bool, string) {
-		argsStr := string(call.Arguments)
-
-		// Only intercept on a hit in the high-risk signature database; otherwise YOLO let it through
-		if telegram.IsDangerousCommand(call.Name, argsStr) {
-			taskID := telegram.NextTaskID()
-			reporter := telegram.ReporterFromCtx(ctx)
-
-			// Suspend the current goroutine, send a message to Telegram, and wait relentlessly for human approval!
-			allowed, reason := telegram.GlobalApprovalMgr.WaitForApproval(ctx, taskID, call.Name, argsStr, reporter)
-			if !allowed {
-				return false, reason // reject, pass the reason back to the LLM
+	if interactive {
+		// Intercept dangerous calls and block on human approval via Telegram.
+		registry.Use(func(ctx context.Context, call schema.ToolCall) (bool, string) {
+			argsStr := string(call.Arguments)
+			if telegram.IsDangerousCommand(call.Name, argsStr) {
+				taskID := telegram.NextTaskID()
+				reporter := telegram.ReporterFromCtx(ctx)
+				allowed, reason := telegram.GlobalApprovalMgr.WaitForApproval(ctx, taskID, call.Name, argsStr, reporter)
+				if !allowed {
+					return false, reason
+				}
+				return true, ""
 			}
-			return true, "" // approve, let the underlying tool through
-		}
-
-		// No blacklist hit, let it through directly
-		return true, ""
-	})
+			return true, ""
+		})
+	}
 
 	eng := engine.NewAgentEngine(llmProvider, registry, false, false)
-
-	// Note: reporter is per-chat and only created when a request arrives, so there is no reporter here (at startup).
-	// SubAgent retrieves the current chat room's reporter from ctx during Execute (agentctx.ReporterFromCtx),
-	// which telegram.handleAgentRun puts into ctx via WithReporter.
 	registry.Register(tools.NewSubagentTool(eng, readOnlyRegistry))
+	return eng
+}
 
-	// init telegram bot
+// runTelegram starts the interactive bot and blocks until shutdown.
+func runTelegram(workDir string) {
+	eng := buildEngine(workDir, true)
 	tb := telegram.NewTelegramBot(eng)
 
-	// Set up graceful shutdown: cancel ctx on Ctrl+C / SIGTERM to let polling exit cleanly
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Start long polling, blocking until ctx is cancelled
 	log.Printf("🚀 golang-harness-agent Telegram service has started")
 	tb.Start(ctx)
+}
+
+// runPrint runs a single task against the workspace and exits.
+func runPrint(workDir, task string) {
+	if task == "" {
+		log.Fatal("print mode (-p): no task provided")
+	}
+
+	eng := buildEngine(workDir, false)
+
+	session := engine.NewSession("cli", workDir)
+	session.Append(schema.Message{Role: schema.RoleUser, Content: task})
+
+	reporter := engine.NewTerminalReporter()
+	ctx := agentctx.WithReporter(context.Background(), reporter)
+
+	if err := eng.Run(ctx, session, reporter); err != nil {
+		fmt.Printf("agent run failed: %v\n", err)
+		os.Exit(1)
+	}
 }
