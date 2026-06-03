@@ -239,8 +239,10 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 
 				// Let the terminal user see what the subagent is doing.
 				var r Reporter
-				if reporter != nil {
-					r = reporter.(Reporter)
+				// Use comma-ok: reporter is typed as any all the way down (agentctx.WithReporter),
+				// so a non-Reporter value must not panic here — fall back to no reporting instead.
+				if rep, ok := reporter.(Reporter); ok {
+					r = rep
 					r.OnToolCall(ctx, fmt.Sprintf("[Subagent] %s", call.Name), string(call.Arguments))
 				}
 
@@ -251,7 +253,8 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 					finalOutput = e.recovery.AnalyzeAndInject(call.Name, result.Output)
 				}
 
-				if reporter != nil {
+				// Guard on r (not reporter): r is only set when the comma-ok assertion above succeeded.
+				if r != nil {
 					display := finalOutput
 					if len(display) > 200 {
 						display = display[:200] + "... (truncated)"

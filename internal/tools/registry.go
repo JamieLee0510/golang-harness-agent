@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime/debug"
 
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
@@ -102,7 +103,9 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 	}
 
 	// 3. Execute the tool.
-	output, err := tool.Execute(ctx, call.Arguments)
+	// safeExecute wraps the foreign tool call in a panic safety net, so a single buggy tool
+	// (nil deref, slice out of range, failed type assertion, ...) cannot crash the whole agent process.
+	output, err := safeExecute(ctx, tool, call.Arguments)
 
 	// 4. Wrap the result and return it to the main loop.
 	if err != nil {
@@ -115,4 +118,17 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 		Output:     output,
 		IsError:    false,
 	}
+}
+
+// safeExecute runs a single tool's Execute and converts any panic into an error,
+func safeExecute(ctx context.Context, tool BaseTool, args json.RawMessage) (output string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Log the full stack trace for debugging (the process no longer crashes, so it
+			// would otherwise be lost), but hand the model only a concise message.
+			log.Printf("[Registry] 🔥 tool '%s' panicked: %v\n%s", tool.Name(), r, debug.Stack())
+			err = fmt.Errorf("tool crashed internally (panic): %v", r)
+		}
+	}()
+	return tool.Execute(ctx, args)
 }
