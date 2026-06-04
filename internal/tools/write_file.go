@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
+	"github.com/JamieLee0510/go-agent-harness/internal/utils"
 )
 
 type WriteFileTool struct {
@@ -56,8 +57,12 @@ func (t *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (stri
 		return "", fmt.Errorf("Failed to parse Args: %w", err)
 	}
 
-	// [Security Defense]: restrict execution within WorkDir to prevent the LLM from modifying system-level files
-	fullPath := filepath.Join(t.workDir, input.Path)
+	// [Security Defense]: resolve within workDir and reject sandbox escapes,
+	// preventing the LLM from writing to system-level files.
+	fullPath, err := utils.ResolvePath(t.workDir, input.Path)
+	if err != nil {
+		return "", err
+	}
 
 	// Automatically create any missing parent directories
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {

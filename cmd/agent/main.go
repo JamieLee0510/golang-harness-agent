@@ -16,9 +16,15 @@ import (
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 	"github.com/JamieLee0510/go-agent-harness/internal/telegram"
 	"github.com/JamieLee0510/go-agent-harness/internal/tools"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Load .env from the current directory if present, so the binary works
+	// without a prior `source .env`. Real env vars already set in the shell
+	// take precedence (godotenv.Load does not overwrite existing vars).
+	_ = godotenv.Load()
+
 	// Two mutually exclusive modes: default Telegram bot, or -p one-shot CLI run.
 	printMode := flag.Bool("p", false, "run one task non-interactively and exit")
 	workdirFlag := flag.String("workdir", "", "sandbox directory (default: ./workspace)")
@@ -28,10 +34,13 @@ func main() {
 		log.Fatal("please set OPENAI_API_KEY in .env first")
 	}
 
+	// Sandbox root: -workdir if given, otherwise the current working directory.
+	// File tools resolve every path against this root and reject escapes
+	// (see internal/tools/resolvePath), so the root no longer needs to be a
+	// dedicated "/workspace" subdir to stay safe.
 	workDir := *workdirFlag
 	if workDir == "" {
-		cwd, _ := os.Getwd()
-		workDir = cwd + "/workspace"
+		workDir, _ = os.Getwd()
 	}
 
 	if *printMode {

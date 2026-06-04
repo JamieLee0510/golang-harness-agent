@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
+	"github.com/JamieLee0510/go-agent-harness/internal/utils"
 )
 
 type EditFileTool struct {
@@ -150,7 +150,10 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", fmt.Errorf("參數解析失敗: %w", err)
 	}
 
-	fullPath := filepath.Join(t.workDir, input.Path)
+	fullPath, err := utils.ResolvePath(t.workDir, input.Path)
+	if err != nil {
+		return "", err
+	}
 
 	// 1. Read the original file content
 	contentBytes, err := os.ReadFile(fullPath)

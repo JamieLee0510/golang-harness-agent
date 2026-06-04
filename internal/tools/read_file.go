@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
+	"github.com/JamieLee0510/go-agent-harness/internal/utils"
 )
 
 // ReadFileTool implement real local file tool
@@ -58,8 +58,13 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", fmt.Errorf("Failed to parse args: %w", err)
 	}
 
-	// 2. concat definite path (notice: prod environment needs to test path-traversal protection, e.g., prevent ../../etc/passwd)
-	fullPath := filepath.Join(t.workDir, input.Path)
+	// 2. Resolve the path against the sandbox root. utils.ResolvePath handles
+	// both relative and absolute inputs and rejects anything that escapes
+	// workDir (path traversal, e.g. ../../etc/passwd).
+	fullPath, err := utils.ResolvePath(t.workDir, input.Path)
+	if err != nil {
+		return "", err
+	}
 
 	// 3. execute IO operation
 	file, err := os.Open(fullPath)
