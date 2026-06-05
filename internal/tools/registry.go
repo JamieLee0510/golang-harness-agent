@@ -26,6 +26,14 @@ type BaseTool interface {
 	Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
+// Closer is an OPTIONAL interface a tool (or any subsystem) may implement when
+// it owns resources that must be released at shutdown — e.g. an MCP client's
+// subprocess or long-lived connection. Stateless local tools need not implement
+// it. Owners are responsible for invoking Close during teardown.
+type Closer interface {
+	Close() error
+}
+
 // Registry manages tool registration, middleware mounting, and routed execution.
 type Registry interface {
 	// Register mounts a new tool into the system.
