@@ -47,9 +47,9 @@ func main() {
 		return
 	}
 
-	if os.Getenv("OPENAI_API_KEY") == "" {
-		log.Fatal("please set OPENAI_API_KEY in .env first")
-	}
+	// Provider/model selection and its API-key check happen in newProviderFromEnv
+	// (called from buildEngine), so they are provider-aware and skipped for the
+	// -mcp-list diagnostic above.
 
 	// Sandbox root: -workdir if given, otherwise the current working directory.
 	// File tools resolve every path against this root and reject escapes
@@ -80,6 +80,46 @@ func resolveConfigPath(override, filename string) string {
 	return filename
 }
 
+// newProviderFromEnv builds the LLM provider from the environment:
+//
+//	MODEL_PROVIDER  "openai" (default) | "claude" (alias: "anthropic")
+//	MODEL_NAME      model id; defaults to "gpt-5-nano" for openai
+//
+// It also validates that the matching API key is set, failing fast with a clear
+// message rather than surfacing an opaque 401 mid-run.
+func newProviderFromEnv() provider.LLMProvider {
+	name := strings.TrimSpace(os.Getenv("MODEL_NAME"))
+
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_PROVIDER"))) {
+	case "", "openai":
+		if name == "" {
+			name = "gpt-5-nano"
+		}
+		requireEnv("OPENAI_API_KEY", "openai")
+		log.Printf("[Provider] openai · model=%s", name)
+		return provider.NewOpenAIProvider(name)
+
+	case "claude", "anthropic":
+		if name == "" {
+			log.Fatal("MODEL_PROVIDER=claude requires MODEL_NAME to be set in .env")
+		}
+		requireEnv("ANTHROPIC_API_KEY", "claude")
+		log.Printf("[Provider] claude · model=%s", name)
+		return provider.NewClaudeProvider(name)
+
+	default:
+		log.Fatalf("unknown MODEL_PROVIDER %q (want \"openai\" or \"claude\")", os.Getenv("MODEL_PROVIDER"))
+		return nil // unreachable
+	}
+}
+
+// requireEnv fatals if the named environment variable is empty.
+func requireEnv(key, providerName string) {
+	if os.Getenv(key) == "" {
+		log.Fatalf("MODEL_PROVIDER=%s requires %s in .env", providerName, key)
+	}
+}
+
 // buildEngine wires the provider, tools and sub-agent shared by both modes.
 // interactive adds the human-in-the-loop approval middleware, which belongs to
 // the interactive front-end and is wired only when that front-end runs.
@@ -89,7 +129,7 @@ func resolveConfigPath(override, filename string) string {
 // caller MUST Close it at shutdown. The Manager is non-nil even when MCP is
 // disabled, so callers can always defer Close unconditionally.
 func buildEngine(ctx context.Context, workDir string, interactive bool, mcpConfigPath string) (*engine.AgentEngine, *mcp.Manager) {
-	llmProvider := provider.NewOpenAIProvider("gpt-5-nano")
+	llmProvider := newProviderFromEnv()
 
 	// Read-only registry for the subagent (grep/read only).
 	readOnlyRegistry := tools.NewRegistry()

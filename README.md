@@ -109,10 +109,13 @@ registered alongside these under a `<server>__<tool>` namespace.
 Requires Go 1.25+.
 
 ```bash
-# 1. Configure secrets (do NOT commit this file).
+# 1. Configure model + secrets (do NOT commit this file).
 cp .env.example .env
-#   OPENAI_API_KEY=sk-...
-#   TELEGRAM_BOT_TOKEN=...   (from @BotFather, only needed for the bot)
+#   MODEL_PROVIDER=openai     # "openai" (default) or "claude"
+#   MODEL_NAME=gpt-5-nano     # model id; for claude e.g. claude-sonnet-4-6
+#   OPENAI_API_KEY=sk-...     # required when MODEL_PROVIDER=openai
+#   ANTHROPIC_API_KEY=sk-ant-...  # required when MODEL_PROVIDER=claude
+#   TELEGRAM_BOT_TOKEN=...    # from @BotFather, only needed for the bot
 
 # 2a. Run the Telegram bot (default mode). .env is auto-loaded — no `source`.
 go run ./cmd/agent
@@ -124,8 +127,10 @@ go run ./cmd/agent -p "list the files in the workspace"
 ```
 
 `.env` in the current directory is loaded automatically at startup (real
-environment variables take precedence). The sandbox root defaults to the
-current working directory; override it with `-workdir <dir>`.
+environment variables take precedence). The LLM backend is chosen by
+`MODEL_PROVIDER` / `MODEL_NAME`, and only the matching API key is required
+(`OPENAI_API_KEY` for openai, `ANTHROPIC_API_KEY` for claude). The sandbox root
+defaults to the current working directory; override it with `-workdir <dir>`.
 
 In Telegram mode, when the agent attempts a dangerous action (`bash rm -rf`,
 `sudo`, writing files, …) it sends an approval request and waits for you to
