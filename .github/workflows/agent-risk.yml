@@ -1,0 +1,30 @@
+name: agent-risk-gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest        # GitHub-hosted runners ship Docker, which the harness needs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Agent risk gate (smoke)
+        uses: JamieLee0510/agent-risk-scanner@v0   # pin a SHA in production
+        with:
+          agent: agent.yaml
+          policy: agent-risk.policy.yaml
+          report: agent-risk-report.json
+          timeout: "120"
+        env:
+          # SCOPED, DISPOSABLE key from repo secrets -- never a production key.
+          # Attack cases deliberately try to make the agent exfiltrate it.
+          OPENAI_API_KEY: ${{ secrets.AGENT_RISK_OPENAI_KEY }}
+
+      - name: Upload report
+        if: always()                # surface the report even when the gate blocks
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-risk-report
+          path: agent-risk-report.json
