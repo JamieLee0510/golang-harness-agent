@@ -5,9 +5,10 @@ orchestration, context management, and human-in-the-loop controls are all
 hand-built, **without any agent framework** (no LangGraph, CrewAI, or AutoGen).
 
 The only third-party dependencies are official API/transport SDKs
-(OpenAI, Anthropic, Telegram). Everything that makes it an *agent* — the
-reasoning loop, tool routing, memory compaction, error recovery, and the
-sub-agent sandbox — is implemented directly on the Go standard library.
+(OpenAI, Anthropic, Telegram, the official MCP Go SDK) plus a dotenv loader.
+Everything that makes it an *agent* — the reasoning loop, tool routing, memory
+compaction, error recovery, the MCP client glue, and the sub-agent sandbox — is
+implemented directly on the Go standard library.
 
 > **Why build this?** Agent frameworks hide the hard parts behind decorators
 > and graph DSLs. This project re-implements those hard parts in ~2.8k lines of
@@ -31,13 +32,16 @@ here it is hand-written and self-contained:
 | **Read-only sub-agent** | `internal/tools/subagent.go` | The main agent can delegate exploration to an isolated sub-loop that only gets a read-only tool registry. |
 | **Concurrent tool execution** | `internal/engine/loop.go` | Tool calls in a turn run in parallel via goroutines into a pre-allocated slice — no mutex, no TOCTOU on shared state. |
 | **Pluggable providers** | `internal/provider/` | A single `LLMProvider` interface backs both OpenAI and Anthropic Claude. |
+| **MCP client** | `internal/mcp/` | Connects to external MCP servers (stdio **and** HTTP/SSE), discovers their tools, and adapts each into a `BaseTool` — the ReAct loop, registry and provider need zero changes. |
+| **Agent Skills** | `internal/context/skill.go` | Project-local `SKILL.md` files discovered from the launch directory and injected into the system prompt; bundled scripts are referenced via the injected `${SKILL_DIR}`. |
+| **Sandbox path safety** | `internal/utils/path.go` | File tools resolve every path against the workspace root and reject traversal / absolute-path escapes (`../../etc/passwd`). |
 
 ---
 
 ## Architecture
 
 ```
-                 Telegram (per-chat sessions)
+        Telegram (per-chat sessions)   ·   CLI one-shot (-p)
                           │
                           ▼
         ┌─────────────────────────────────────┐
@@ -61,6 +65,13 @@ here it is hand-written and self-contained:
                               └────────────────────┘
 ```
 
+Beyond the local tools, the `tools.Registry` is also fed by **MCP servers**
+(`internal/mcp`): at startup the agent reads `.agent/mcp.json`, connects to each
+server (stdio or HTTP/SSE), and registers every remote tool as a namespaced
+`BaseTool` (`<server>__<tool>`). Two project-local config sources — `.agent/mcp.json`
+and `.agent/skills/*/SKILL.md` — are resolved from the **launch directory**, so
+config belongs to the project you run the agent from, not the binary's location.
+
 The `reporter` (per-chat output sink) flows down through `context.Context`
 (`internal/agentctx`) so that middleware and the sub-agent can report progress
 back to the right Telegram chat — without `tools` ever importing `telegram`
@@ -71,12 +82,14 @@ back to the right Telegram chat — without `tools` ever importing `telegram`
 ## Package layout
 
 ```
-cmd/agent            Entry point (wires provider, registry, middleware, bot)
+cmd/agent            Entry point (wires provider, registry, middleware, bot, MCP)
 internal/engine      ReAct main loop, sessions, sub-agent runner, reminder
 internal/tools       Tool registry + middleware, and the tools themselves
+internal/mcp         MCP client: config, transport, adapter, manager (lifecycle)
 internal/provider    LLMProvider interface + OpenAI / Anthropic implementations
 internal/context     Prompt composer, context compactor, error recovery, skills
 internal/telegram    Telegram bot front-end, reporter, approval flow
+internal/utils       Shared helpers (sandbox-safe path resolution)
 internal/agentctx    Neutral context keys shared across layers (breaks cycles)
 internal/schema      Shared message / tool-call types
 ```
@@ -86,7 +99,8 @@ internal/schema      Shared message / tool-call types
 `read_file`, `write_file`, `edit_file` (4-level fuzzy replace),
 `bash`, and `spawn_subagent`. Background-process tools
 (`bash_background`, `task_list`, `task_logs`, `task_kill`) are implemented and
-ready to register.
+ready to register. Any tools exposed by configured **MCP servers** are
+registered alongside these under a `<server>__<tool>` namespace.
 
 ---
 
@@ -95,22 +109,79 @@ ready to register.
 Requires Go 1.25+.
 
 ```bash
-# 1. Configure secrets (do NOT commit this file)
+# 1. Configure secrets (do NOT commit this file).
 cp .env.example .env
 #   OPENAI_API_KEY=sk-...
-#   TELEGRAM_BOT_TOKEN=...   (from @BotFather)
+#   TELEGRAM_BOT_TOKEN=...   (from @BotFather, only needed for the bot)
 
-# 2. Load env and run the Telegram bot
-source .env
+# 2a. Run the Telegram bot (default mode). .env is auto-loaded — no `source`.
 go run ./cmd/agent
+
+# 2b. …or run a single task non-interactively and exit (CLI mode).
+#     NOTE: flags must come BEFORE the task text (Go flag parsing stops at
+#     the first positional arg).
+go run ./cmd/agent -p "list the files in the workspace"
 ```
 
-Then message your bot on Telegram. Each chat keeps its own session/history.
-When the agent attempts a dangerous action (`bash rm -rf`, `sudo`, writing
-files, …) it sends an approval request and waits for you to reply
-`approve <id>` or `reject <id>`.
+`.env` in the current directory is loaded automatically at startup (real
+environment variables take precedence). The sandbox root defaults to the
+current working directory; override it with `-workdir <dir>`.
 
-The agent operates inside the `./workspace` directory as its sandbox.
+In Telegram mode, when the agent attempts a dangerous action (`bash rm -rf`,
+`sudo`, writing files, …) it sends an approval request and waits for you to
+reply `approve <id>` or `reject <id>`. CLI mode (`-p`) runs without the
+approval gate.
+
+### MCP servers
+
+Declare MCP servers in `.agent/mcp.json` (resolved relative to the launch
+directory; override with `-mcp-config <path>`):
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp.example.com/sse",
+      "headers": { "Authorization": "Bearer ${API_TOKEN}" }
+    }
+  }
+}
+```
+
+- `stdio` spawns a subprocess; `http` connects over Streamable HTTP / SSE.
+  `${VAR}` in `url`/`headers` is expanded from the environment.
+- For stdio servers, `env` lists the **names** of variables to forward into the
+  subprocess (`PATH`/`HOME` are always forwarded so the command resolves).
+- List the tools a server exposes without starting the agent:
+
+  ```bash
+  go run ./cmd/agent -mcp-list
+  ```
+
+### Agent Skills
+
+Drop skills under `.agent/skills/<name>/SKILL.md` (also resolved from the launch
+directory). Each is parsed for `name` / `description` frontmatter and its body
+is injected into the system prompt. A skill may bundle scripts and reference
+them with `${SKILL_DIR}`, which is substituted with the skill's absolute
+directory at load time:
+
+```markdown
+---
+name: image-grayscale
+description: Use when the user asks to convert an image to black & white.
+---
+Run the bundled script via the bash tool:
+    python3 ${SKILL_DIR}/to_grayscale.py <input> [output]
+```
+
+> `.agent/` is git-ignored by default — it holds machine-local config.
 
 ---
 
@@ -152,6 +223,12 @@ This is a learning/portfolio project, not production software.
   `Session.Append`).
 - Error recovery uses keyword matching — intentionally illustrative (see above).
 - No retry/back-off on provider calls yet.
+- MCP discovery is **static**: `mcp.json` is read once at startup; editing it
+  requires a restart (no hot-reload / `list_changed` refresh).
+- MCP tool descriptions and results are **not yet isolated as untrusted input**
+  (tool-poisoning / indirect injection surface — see `.self-note`).
+- Skill parsing is line-based frontmatter; the progressive-disclosure and
+  conditional-`paths` activation from the design notes are not implemented.
 - Test coverage is a work in progress.
 
 ## License
