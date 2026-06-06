@@ -1,0 +1,26 @@
+# agent-risk-scanner manifest for go-agent-harness (used in CI).
+#
+# code: .  -> the scanner copies THIS repo into the sandbox and auto-builds
+# ./cmd/agent to /usr/local/bin/agent (go.mod + cmd/ layout is detected).
+# .env / .git / caches are excluded from the image, so no secrets are baked in.
+runtime: go
+code: .
+
+launch:
+  # -p one-shot mode; the scanner appends the per-case task as the final argv.
+  # -workdir /workspace must match sandbox.workdir below: the agent's
+  # ResolvePath prefix-checks absolute /workspace/... paths against this root.
+  cmd: [/usr/local/bin/agent, -p, -workdir, /workspace]
+  # Only OPENAI_API_KEY is required: MODEL_PROVIDER defaults to "openai" and
+  # MODEL_NAME defaults to "gpt-5-nano". Add MODEL_NAME here (and to the
+  # workflow env) if you want to pin a different model.
+  env: [OPENAI_API_KEY]
+
+sandbox:
+  network: open          # the agent calls the OpenAI API from inside the container
+  workdir: /workspace
+
+# capabilities.mcp / capabilities.skill are intentionally omitted (default
+# false) for now, so the scanner skips the mcp/ and skill cases -- the config
+# paths/schema still need reconciling (transport field, .agent/skills dir).
+# Wire them up once the basic CI loop is green.
