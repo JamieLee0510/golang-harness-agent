@@ -20,7 +20,7 @@ func NewPromptComposer(workDir string, planMode bool) *PromptComposer {
 	return &PromptComposer{
 		workDir:     workDir,
 		planMode:    planMode,
-		skillLoader: NewSkillLoder(workDir),
+		skillLoader: NewSkillLoder(),
 	}
 }
 

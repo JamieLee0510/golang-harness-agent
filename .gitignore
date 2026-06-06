@@ -2,6 +2,9 @@
 .env
 .self-note
 
+# local agent config / skills (.agent/skills/<name>/SKILL.md)
+.agent/
+
 # compiled binary from `go build -o agent ./cmd/agent`
 # anchored to repo root so the cmd/agent/ source dir is NOT ignored
 /agent

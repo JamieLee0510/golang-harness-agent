@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -29,14 +30,20 @@ func main() {
 	// Two mutually exclusive modes: default Telegram bot, or -p one-shot CLI run.
 	printMode := flag.Bool("p", false, "run one task non-interactively and exit")
 	workdirFlag := flag.String("workdir", "", "sandbox directory (default: ./workspace)")
-	mcpConfigFlag := flag.String("mcp-config", "mcp.json", "path to the MCP server config")
+	mcpConfigFlag := flag.String("mcp-config", "", "path to the MCP server config (default: ./.agent/mcp.json in the current directory)")
 	mcpListFlag := flag.Bool("mcp-list", false, "connect to configured MCP servers, print their tools, and exit")
 	flag.Parse()
+
+	// Resolve the MCP config path. When -mcp-config is given it is used as-is
+	// (relative to cwd or absolute); otherwise it defaults to .agent/mcp.json in
+	// the current working directory, alongside .agent/skills/ — so all agent
+	// config belongs to the project you launch from, not the binary's location.
+	mcpConfigPath := resolveConfigPath(*mcpConfigFlag, filepath.Join(".agent", "mcp.json"))
 
 	// Diagnostic mode: list tools from configured MCP servers and exit. This
 	// needs no LLM, so it runs before the OPENAI_API_KEY check.
 	if *mcpListFlag {
-		runMCPList(*mcpConfigFlag)
+		runMCPList(mcpConfigPath)
 		return
 	}
 
@@ -54,10 +61,23 @@ func main() {
 	}
 
 	if *printMode {
-		runPrint(workDir, strings.TrimSpace(strings.Join(flag.Args(), " ")), *mcpConfigFlag)
+		runPrint(workDir, strings.TrimSpace(strings.Join(flag.Args(), " ")), mcpConfigPath)
 		return
 	}
-	runTelegram(workDir, *mcpConfigFlag)
+	runTelegram(workDir, mcpConfigPath)
+}
+
+// resolveConfigPath returns override if non-empty (used as-is); otherwise it
+// resolves filename against the current working directory — i.e. config belongs
+// to the project you launch the agent from, not to the binary's install dir.
+func resolveConfigPath(override, filename string) string {
+	if override != "" {
+		return override
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return filepath.Join(cwd, filename)
+	}
+	return filename
 }
 
 // buildEngine wires the provider, tools and sub-agent shared by both modes.

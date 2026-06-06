@@ -32,7 +32,7 @@ func NewSession(id string, workDir string) *Session {
 // Append appends one or more messages to the Session in a thread-safe manner.
 //
 // Persistence placeholder: an industrial-grade implementation (like Claude Code) would here append
-// the history in JSONL form to workDir/.claw/sessions/xxx.jsonl.
+// the history in JSONL form to workDir/.agent/sessions/xxx.jsonl.
 func (s *Session) Append(msgs ...schema.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
