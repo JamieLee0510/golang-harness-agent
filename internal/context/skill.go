@@ -73,18 +73,18 @@ func loadSkillsFrom(skillBaseDir string) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("\n### 可用專業技能（Agent Skills）\n")
-	b.WriteString("以下是你擁有的標準化外掛技能，請在符合 description 描述的場景下嚴格遵循其正文指令：\n\n")
+	b.WriteString("\n### Available Skills (Agent Skills)\n")
+	b.WriteString("The following are standardized plug-in skills available to you. When a scenario matches a skill's description, strictly follow the instructions in its body:\n\n")
 	for _, skill := range skills {
-		fmt.Fprintf(&b, "### 技能名稱： %s\n", skill.Name)
-		fmt.Fprintf(&b, "**觸發條件**: %s\n", skill.Description)
+		fmt.Fprintf(&b, "### Skill name: %s\n", skill.Name)
+		fmt.Fprintf(&b, "**When to use**: %s\n", skill.Description)
 		// Tell the model where this skill's bundled files live, so script-style
 		// skills can be invoked with an absolute path (also exposed as
 		// ${SKILL_DIR} inside the body).
 		if skill.Dir != "" {
-			fmt.Fprintf(&b, "**技能目錄 (base dir，附帶的腳本/檔案都在這裡)**: %s\n", skill.Dir)
+			fmt.Fprintf(&b, "**Base directory (bundled scripts/files live here)**: %s\n", skill.Dir)
 		}
-		b.WriteString("\n**執行指南**:\n")
+		b.WriteString("\n**Instructions**:\n")
 		b.WriteString(skill.Body)
 		b.WriteString("\n\n---\n")
 	}
