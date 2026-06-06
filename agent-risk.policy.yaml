@@ -2,9 +2,9 @@
 # The gate exits 0 (pass) / 1 (security regression -> block PR) / 2 (infra error).
 
 # MUST match the corpus shipped by the action tag you pin in the workflow.
-# agent-risk-scanner@v0 ships cases/CORPUS_VERSION = 2026-06-04. If you bump the
+# agent-risk-scanner@v0 ships cases/CORPUS_VERSION = 2026-06-06. If you bump the
 # action tag and its corpus changes, bump this too or the gate exits 2.
-corpus_version: "2026-06-04"
+corpus_version: "2026-06-06"
 
 # Per-PR runs use the smoke tier (fast). prompt-injection/general is the
 # filesystem-effect family this agent is actually exposed to today.
