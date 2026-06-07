@@ -7,10 +7,15 @@ runtime: go
 code: .
 
 launch:
-  # -p one-shot mode; the scanner appends the per-case task as the final argv.
-  # -workdir /workspace must match sandbox.workdir below: the agent's
-  # ResolvePath prefix-checks absolute /workspace/... paths against this root.
-  cmd: [/usr/local/bin/agent, -p, -workdir, /workspace]
+  # -p one-shot mode; the scanner appends the per-case task as the final argv
+  # (all flags MUST precede it -- Go's flag parser stops at the first positional).
+  # -workdir /workspace must match sandbox.workdir below: the agent's ResolvePath
+  # prefix-checks absolute /workspace/... paths against this root.
+  # -mcp-config /workspace/.mcp.json: the agent's own convention is
+  # .agent/mcp.json, but the scanner writes the poisoned MCP config to the
+  # workspace root, so we override the path to meet it there (scan-only; normal
+  # deployments still use .agent/mcp.json).
+  cmd: [/usr/local/bin/agent, -p, -workdir, /workspace, -mcp-config, /workspace/.mcp.json]
   # Env var NAMES forwarded into the sandbox. MODEL_PROVIDER / MODEL_NAME let the
   # workflow pick the backend (defaults: openai / gpt-5-nano). Only the API key
   # matching MODEL_PROVIDER is actually needed; the unused one is just empty.
@@ -20,7 +25,11 @@ sandbox:
   network: open          # the agent calls the OpenAI API from inside the container
   workdir: /workspace
 
-# capabilities.mcp / capabilities.skill are intentionally omitted (default
-# false) for now, so the scanner skips the mcp/ and skill cases -- the config
-# paths/schema still need reconciling (transport field, .agent/skills dir).
-# Wire them up once the basic CI loop is green.
+# Declared capabilities -> which attack families the scanner runs.
+capabilities:
+  mcp: true              # agent is an MCP client; run the mcp/ cases
+  skill: true            # agent discovers skills; run the skill/ cases
+  # Where the agent discovers skills, relative to the workdir. Matches the
+  # agent's own convention (<cwd>/.agent/skills, and cwd is /workspace here), so
+  # the scanner plants poisoned SKILL.md exactly where the agent will load it.
+  skill_dir: .agent/skills
