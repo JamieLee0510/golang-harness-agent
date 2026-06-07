@@ -1,5 +1,11 @@
 name: agent-risk-scan
 
+# contents:write lets the report-publish step push the rendered dashboard to the
+# gh-pages branch (Settings -> Pages -> Source: gh-pages). Default GITHUB_TOKEN
+# is otherwise read-only on many repos, which would fail the deploy.
+permissions:
+  contents: write
+
 # Manual-only: running the scanner spins up the agent against many attack cases
 # and burns LLM tokens, so it is NOT wired to push/pull_request. Trigger it on
 # demand from the Actions tab (or `gh workflow run agent-risk-scan`).
@@ -111,9 +117,48 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.AGENT_RISK_OPENAI_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.AGENT_RISK_ANTHROPIC_KEY }}
 
+      # Bake the JSON into the self-contained HTML dashboard. The scanner CLI is
+      # already on PATH (the action pip-installed it), and the gate writes the
+      # JSON BEFORE deciding pass/fail -- so this runs (if: always) and produces
+      # a report even when the gate fails, which is exactly when you want to look.
+      - name: Render HTML report
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f agent-risk-report.json   # written by the scan step above
+          mkdir -p site
+          agent-risk-scan report agent-risk-report.json --out site/index.html
+
+      # Publish to this repo's gh-pages branch under runs/<run_id>/ so each manual
+      # run gets its own permanent URL. keep_files keeps older runs' pages around.
+      - name: Publish report to GitHub Pages
+        if: always()
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          destination_dir: runs/${{ github.run_id }}
+          keep_files: true
+
+      # A clickable link on the run's summary page (workflow_dispatch has no PR to
+      # comment on, so the job summary is where the link belongs).
+      - name: Link report in job summary
+        if: always()
+        run: |
+          url="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/runs/${{ github.run_id }}/"
+          {
+            echo "## 🔗 Agent Risk report"
+            echo ""
+            echo "[$url]($url)"
+            echo ""
+            echo "_Published to GitHub Pages. First run also creates the \`gh-pages\` branch — set Settings → Pages → Source to it once._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload report
         if: always()                # surface the report even when the scan fails
         uses: actions/upload-artifact@v4
         with:
           name: agent-risk-report
-          path: agent-risk-report.json
+          path: |
+            agent-risk-report.json
+            site/index.html
