@@ -10,6 +10,7 @@ import (
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 
+	ctxpkg "github.com/JamieLee0510/go-agent-harness/internal/context"
 	"github.com/JamieLee0510/go-agent-harness/internal/engine"
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
@@ -85,7 +86,7 @@ func (b *TelegramBot) handleAgentRun(chatID int64, prompt string) {
 	// Use chatID as the key to keep a separate conversation history per session
 	workDir, _ := os.Getwd()
 	workDir += "/workspace"
-	session := engine.GlobalSessionMgr.GetOrCreate(strconv.FormatInt(chatID, 10), workDir)
+	session := ctxpkg.GlobalSessionMgr.GetOrCreate(strconv.FormatInt(chatID, 10), workDir)
 
 	// Run only reads working memory, so we must first append the user input as a user message
 	session.Append(schema.Message{

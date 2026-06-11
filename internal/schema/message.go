@@ -10,13 +10,17 @@ const (
 	RoleAssistant Role = "assistant" // model output: including Reasoning or ToolCall
 )
 
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`     // input tokens
+	CompletionTokens int `json:"completion_tokens"` // output tokens
+}
+
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
-
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-
-	ToolCallId string `json:"tool_call_id,omitempty"`
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallId string     `json:"tool_call_id,omitempty"`
+	Usage      *Usage     `json:"usage,omitempty"`
 }
 
 type ToolCall struct {

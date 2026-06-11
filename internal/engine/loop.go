@@ -39,7 +39,11 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 
 // Run wakes the specified session and executes the ReAct main loop until the model no longer requests tools.
 // reporter may be nil (pure backend mode), in which case all progress reporting is skipped.
-func (e *AgentEngine) Run(ctx context.Context, session *Session, reporter Reporter) error {
+func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter Reporter) error {
+	// Bind the session to ctx so layers below the engine (the cost tracker wrapping the provider, and the
+	// subagent loop spawned via RunSub which inherits this ctx) can attribute token usage to this session.
+	ctx = ctxpkg.WithSession(ctx, session)
+
 	log.Printf("[Engine] awake session [%s], and lock workspace: %s\n", session.ID, session.WorkDir)
 
 	// Dynamically assemble the System Prompt: each session is bound to its own WorkDir,

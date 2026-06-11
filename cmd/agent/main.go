@@ -12,8 +12,10 @@ import (
 	"syscall"
 
 	"github.com/JamieLee0510/go-agent-harness/internal/agentctx"
+	ctxpkg "github.com/JamieLee0510/go-agent-harness/internal/context"
 	"github.com/JamieLee0510/go-agent-harness/internal/engine"
 	"github.com/JamieLee0510/go-agent-harness/internal/mcp"
+	"github.com/JamieLee0510/go-agent-harness/internal/observability"
 	"github.com/JamieLee0510/go-agent-harness/internal/provider"
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 	"github.com/JamieLee0510/go-agent-harness/internal/telegram"
@@ -87,7 +89,9 @@ func resolveConfigPath(override, filename string) string {
 //
 // It also validates that the matching API key is set, failing fast with a clear
 // message rather than surfacing an opaque 401 mid-run.
-func newProviderFromEnv() provider.LLMProvider {
+// It returns both the provider and the resolved model name, so the caller can wrap the provider in a
+// CostTracker (which prices usage by model name) before handing it to the engine.
+func newProviderFromEnv() (provider.LLMProvider, string) {
 	name := strings.TrimSpace(os.Getenv("MODEL_NAME"))
 
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("MODEL_PROVIDER"))) {
@@ -97,7 +101,7 @@ func newProviderFromEnv() provider.LLMProvider {
 		}
 		requireEnv("OPENAI_API_KEY", "openai")
 		log.Printf("[Provider] openai · model=%s", name)
-		return provider.NewOpenAIProvider(name)
+		return provider.NewOpenAIProvider(name), name
 
 	case "claude", "anthropic":
 		if name == "" {
@@ -105,11 +109,11 @@ func newProviderFromEnv() provider.LLMProvider {
 		}
 		requireEnv("ANTHROPIC_API_KEY", "claude")
 		log.Printf("[Provider] claude · model=%s", name)
-		return provider.NewClaudeProvider(name)
+		return provider.NewClaudeProvider(name), name
 
 	default:
 		log.Fatalf("unknown MODEL_PROVIDER %q (want \"openai\" or \"claude\")", os.Getenv("MODEL_PROVIDER"))
-		return nil // unreachable
+		return nil, "" // unreachable
 	}
 }
 
@@ -128,9 +132,9 @@ func requireEnv(key, providerName string) {
 // the main registry. The returned *mcp.Manager owns those connections; the
 // caller MUST Close it at shutdown. The Manager is non-nil even when MCP is
 // disabled, so callers can always defer Close unconditionally.
-func buildEngine(ctx context.Context, workDir string, interactive bool, mcpConfigPath string) (*engine.AgentEngine, *mcp.Manager) {
-	llmProvider := newProviderFromEnv()
-
+// llmProvider is supplied by the caller (already wrapped in any decorators such as the CostTracker),
+// so buildEngine stays agnostic about pricing/observability.
+func buildEngine(ctx context.Context, workDir string, interactive bool, mcpConfigPath string, llmProvider provider.LLMProvider) (*engine.AgentEngine, *mcp.Manager) {
 	// Read-only registry for the subagent (grep/read only).
 	readOnlyRegistry := tools.NewRegistry()
 	readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
@@ -180,7 +184,12 @@ func runTelegram(workDir, mcpConfigPath string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	eng, mcpMgr := buildEngine(ctx, workDir, true, mcpConfigPath)
+	// One shared, session-agnostic tracker: it reads each request's session from ctx, so it bills every
+	// Telegram chat's tokens to that chat's own session without per-chat reconstruction.
+	realProvider, modelName := newProviderFromEnv()
+	trackedProvider := observability.NewCostTracker(realProvider, modelName)
+
+	eng, mcpMgr := buildEngine(ctx, workDir, true, mcpConfigPath, trackedProvider)
 	defer mcpMgr.Close()
 
 	tb := telegram.NewTelegramBot(eng)
@@ -198,9 +207,12 @@ func runPrint(workDir, task, mcpConfigPath string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	eng, mcpMgr := buildEngine(ctx, workDir, false, mcpConfigPath)
+	realProvider, modelName := newProviderFromEnv()
+	trackedProvider := observability.NewCostTracker(realProvider, modelName)
 
-	session := engine.NewSession("cli", workDir)
+	eng, mcpMgr := buildEngine(ctx, workDir, false, mcpConfigPath, trackedProvider)
+
+	session := ctxpkg.NewSession("cli", workDir)
 	session.Append(schema.Message{Role: schema.RoleUser, Content: task})
 
 	reporter := engine.NewTerminalReporter()
