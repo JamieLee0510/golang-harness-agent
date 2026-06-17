@@ -102,7 +102,7 @@ func (s *Session) RecordUsage(prompt int, completion int, cost float64) {
 	defer s.mu.Unlock()
 	s.TotalPromptTokens += prompt
 	s.TotalCompletionTokens += completion
-	s.TotalCostUSD = cost
+	s.TotalCostUSD += cost // accumulate per-call cost into the session total (each call passes only its own cost)
 }
 
 // SessionManager manages multiple sessions, used for multi-user / multi-terminal isolation.
