@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	ctxpkg "github.com/JamieLee0510/go-agent-harness/internal/context"
+	"github.com/JamieLee0510/go-agent-harness/internal/observability"
 	"github.com/JamieLee0510/go-agent-harness/internal/provider"
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 	"github.com/JamieLee0510/go-agent-harness/internal/tools"
@@ -44,6 +45,18 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	// subagent loop spawned via RunSub which inherits this ctx) can attribute token usage to this session.
 	ctx = ctxpkg.WithSession(ctx, session)
 
+	// Open the root span covering the whole task. Started after WithSession so the ctx
+	// carried downstream holds both the session and the span.
+	ctx, rootSpan := observability.StartSpan(ctx, "Agent.Run")
+	rootSpan.AddAttribute("session_id", session.ID)
+	rootSpan.AddAttribute("work_dir", session.WorkDir)
+
+	// On any exit (success or error), close the root span and dump the trace tree to disk.
+	defer func() {
+		rootSpan.EndSpan()
+		_ = observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID)
+	}()
+
 	log.Printf("[Engine] awake session [%s], and lock workspace: %s\n", session.ID, session.WorkDir)
 
 	// Dynamically assemble the System Prompt: each session is bound to its own WorkDir,
@@ -57,6 +70,10 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		turnCount++
 		log.Printf("======== [Turn %d] start =======\n", turnCount)
 
+		// Per-turn span. Do NOT defer EndSpan here: defer fires at function return, not at
+		// the end of a loop iteration, so it is closed explicitly on every exit path below.
+		turnCtx, turnSpan := observability.StartSpan(ctx, fmt.Sprintf("Turn-%d", turnCount))
+
 		availableTools := e.registry.GetAvailableTools()
 
 		// Pull recent Working Memory from the Session (the latest 20 messages, leaving the compactor enough room to make decisions).
@@ -69,14 +86,21 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		// Run through the compactor before inference: when total character count exceeds the limit, early logs are masked and oversized logs are trimmed at both ends.
 		compactedContext := e.compactor.Compact(contextHistory)
 
+		// Record the actual context size sent to the model; handy for diagnosing hallucinations.
+		turnSpan.AddAttribute("context_message_count", len(compactedContext))
+
 		// Phase 1: thinking stage. Strip tools to force the model to plan first.
 		if e.EnableThinking {
 			log.Printf("[Enging][Phase 1] deprivate tools and force to thinking stage")
 			if reporter != nil {
-				reporter.OnThinking(ctx)
+				reporter.OnThinking(turnCtx)
 			}
-			thinkResp, err := e.provider.Generate(ctx, compactedContext, nil)
+			// Span around the thinking inference call.
+			thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
+			thinkResp, err := e.provider.Generate(thinkCtx, compactedContext, nil)
+			thinkSpan.EndSpan()
 			if err != nil {
+				turnSpan.EndSpan()
 				return fmt.Errorf("Thinking stage failed: %w", err)
 			}
 
@@ -90,10 +114,15 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 		// Phase 2: action stage. Restore tools and wait for the model to act according to its plan.
 		log.Printf("[Enging][Phase 2] recover tools and wait for model actions")
-		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
+		// Span around the action inference call.
+		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
+		actionResp, err := e.provider.Generate(actCtx, compactedContext, availableTools)
+		actSpan.EndSpan()
 		if err != nil {
+			turnSpan.EndSpan()
 			return fmt.Errorf("Model generate failed: %w", err)
 		}
+		actSpan.AddAttribute("tool_call_count", len(actionResp.ToolCalls))
 
 		session.Append(*actionResp)
 		compactedContext = append(compactedContext, *actionResp)
@@ -106,6 +135,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		// Termination condition: the model no longer requests tools, meaning the task is complete.
 		if len(actionResp.ToolCalls) == 0 {
 			log.Printf("[Engine] finish task, break the loop.")
+			turnSpan.EndSpan()
 			break
 		}
 
@@ -133,7 +163,10 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
 				}
 
-				result := e.registry.Execute(ctx, call)
+				// Pass turnCtx so the tool span opened inside registry.Execute (and any nested
+				// subagent spans) hang off this turn. Concurrent calls are safe: Span.mu guards
+				// the parallel appends to the turn's Children.
+				result := e.registry.Execute(turnCtx, call)
 
 				// On execution error, hand off to the RecoveryManager to diagnose and inject corrective suggestions.
 				finalOutput := result.Output
@@ -179,6 +212,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		if reminderMsg != nil {
 			session.Append(*reminderMsg)
 		}
+
+		// Close the turn span before looping into the next turn.
+		turnSpan.EndSpan()
 	}
 	return nil
 }
@@ -187,6 +223,12 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 // and returns a refined summary once exploration is complete. reporter is an any, asserted back to Reporter by this function before use;
 // when nil, progress reporting is skipped.
 func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyRegistry tools.Registry, reporter any) (string, error) {
+	// Span for the whole subagent run. Its parent is the tool span that spawned it (the ctx
+	// passed in carries that span), so the subagent's tree nests under the main agent's.
+	ctx, subSpan := observability.StartSpan(ctx, "Subagent.Run")
+	subSpan.AddAttribute("task_prompt", taskPrompt)
+	defer subSpan.EndSpan()
+
 	// Subagents tend to be lazy, so the System Prompt must strictly require it to verify via tools.
 	contextHistory := []schema.Message{
 		{
@@ -215,14 +257,20 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 			return "", fmt.Errorf("subagent explored too deeply and was force-recalled after exceeding %d turns; please have the main Agent give it clearer instructions", maxSubTurns)
 		}
 
+		// Per-turn span under the subagent run. Closed explicitly on each exit path (not deferred in a loop).
+		turnCtx, turnSpan := observability.StartSpan(ctx, fmt.Sprintf("Subagent.Turn-%d", turnCount))
+
 		// The subagent can only access the read-only tool registry passed in.
 		availableTools := readOnlyRegistry.GetAvailableTools()
 
 		compactedContext := e.compactor.Compact(contextHistory)
 
 		// Subtasks require fast responses, so slow thinking is forcibly disabled and actions are predicted directly.
-		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
+		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
+		actionResp, err := e.provider.Generate(actCtx, compactedContext, availableTools)
+		actSpan.EndSpan()
 		if err != nil {
+			turnSpan.EndSpan()
 			return "", fmt.Errorf("subagent inference failed: %w", err)
 		}
 
@@ -230,6 +278,7 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 
 		// Exit condition: the subagent no longer calls tools, meaning it has finished its summary report.
 		if len(actionResp.ToolCalls) == 0 {
+			turnSpan.EndSpan()
 			return actionResp.Content, nil
 		}
 
@@ -250,7 +299,8 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 					r.OnToolCall(ctx, fmt.Sprintf("[Subagent] %s", call.Name), string(call.Arguments))
 				}
 
-				result := readOnlyRegistry.Execute(ctx, call)
+				// turnCtx parents the tool span opened inside registry.Execute under this subagent turn.
+				result := readOnlyRegistry.Execute(turnCtx, call)
 
 				finalOutput := result.Output
 				if result.IsError {
@@ -276,5 +326,8 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 
 		wg.Wait()
 		contextHistory = append(contextHistory, observationMsgs...)
+
+		// Close this subagent turn before looping.
+		turnSpan.EndSpan()
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log"
 	"runtime/debug"
 
+	"github.com/JamieLee0510/go-agent-harness/internal/observability"
 	"github.com/JamieLee0510/go-agent-harness/internal/schema"
 )
 
@@ -86,10 +87,19 @@ func (r *registryImpl) GetAvailableTools() []schema.ToolDefinition {
 }
 
 func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema.ToolResult {
+	// Open one span per tool execution. This is the single source of truth for tool tracing:
+	// both the main loop and the subagent loop route through here, so every execution — including
+	// middleware interceptions and panics — is captured in one place.
+	_, span := observability.StartSpan(ctx, "Tool."+call.Name)
+	span.AddAttribute("tool_name", call.Name)
+	span.AddAttribute("arguments", string(call.Arguments))
+	defer span.EndSpan()
+
 	// 1. Route lookup; not found usually means the model hallucinated a nonexistent tool.
 	tool, exists := r.tools[call.Name]
 	if !exists {
 		errMsg := fmt.Sprintf("Error: the tool '%s' doesn't exist in system", call.Name)
+		span.AddAttribute("error", "tool not found")
 		return schema.ToolResult{
 			ToolCallId: call.ID,
 			Output:     errMsg,
@@ -102,6 +112,8 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 		allowed, rejectReason := mw(ctx, call)
 		if !allowed {
 			log.Printf("[Registry] ⚠️ Tool %s intercepted by Middleware: %s\n", call.Name, rejectReason)
+			span.AddAttribute("intercepted", true)
+			span.AddAttribute("reject_reason", rejectReason)
 			return schema.ToolResult{
 				ToolCallId: call.ID,
 				Output:     fmt.Sprintf("Execution intercepted by the system. Reason: %s", rejectReason),
@@ -118,14 +130,29 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 	// 4. Wrap the result and return it to the main loop.
 	if err != nil {
 		errMsg := fmt.Sprintf("Error executing %s: %v", call.Name, err)
+		span.AddAttribute("error", err.Error())
 		return schema.ToolResult{ToolCallId: call.ID, Output: errMsg, IsError: true}
 	}
+
+	// Store only a short preview of the output to keep the trace file from bloating.
+	span.AddAttribute("output_preview", truncate(output, 100))
 
 	return schema.ToolResult{
 		ToolCallId: call.ID,
 		Output:     output,
 		IsError:    false,
 	}
+}
+
+// truncate caps a string at max runes for safe inclusion in trace attributes.
+// Counting runes (not bytes) avoids slicing through a multi-byte character — important
+// for non-ASCII output, which would otherwise produce invalid UTF-8 in the trace.
+func truncate(s string, max int) string {
+	rs := []rune(s)
+	if len(rs) > max {
+		return string(rs[:max]) + "..."
+	}
+	return s
 }
 
 // safeExecute runs a single tool's Execute and converts any panic into an error,
