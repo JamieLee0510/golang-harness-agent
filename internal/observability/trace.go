@@ -14,12 +14,12 @@ import (
 type traceKey struct{}
 
 type Span struct {
-	Name       string                 `json:"name"`
-	StartTime  time.Time              `json:"start_time"`
-	EndTime    time.Time              `json:"end_time"`
-	DurationMs int64                  `json:"duration_ms"`
-	Attributes map[string]interface{} `json:"attributes,omitempty"`
-	Children   []*Span                `json:"children,omitempty"`
+	Name       string         `json:"name"`
+	StartTime  time.Time      `json:"start_time"`
+	EndTime    time.Time      `json:"end_time"`
+	DurationMs int64          `json:"duration_ms"`
+	Attributes map[string]any `json:"attributes,omitempty"`
+	Children   []*Span        `json:"children,omitempty"`
 
 	mu sync.Mutex // protect Children parallel writing
 }
@@ -28,7 +28,7 @@ func StartSpan(ctx context.Context, name string) (context.Context, *Span) {
 	span := &Span{
 		Name:       name,
 		StartTime:  time.Now(),
-		Attributes: make(map[string]interface{}),
+		Attributes: make(map[string]any),
 	}
 
 	if parent, ok := ctx.Value(traceKey{}).(*Span); ok {
@@ -46,7 +46,7 @@ func (s *Span) EndSpan() {
 	s.DurationMs = s.EndTime.Sub(s.StartTime).Milliseconds()
 }
 
-func (s *Span) AddAttribute(key string, value interface{}) {
+func (s *Span) AddAttribute(key string, value any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Attributes[key] = value
