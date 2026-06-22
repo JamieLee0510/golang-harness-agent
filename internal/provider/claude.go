@@ -22,6 +22,26 @@ func NewClaudeProvider(model string) *ClaudeProvider {
 	return &ClaudeProvider{client: anthropic.NewClient(option.WithAPIKey(apiKey)), model: model}
 }
 
+// toStringSlice coerces a schema "required" value into []string. It accepts the
+// native []string (local tools) as well as []interface{} of strings (MCP tools
+// or any JSON-decoded schema), returning nil for anything else.
+func toStringSlice(v any) []string {
+	switch s := v.(type) {
+	case []string:
+		return s
+	case []any:
+		out := make([]string, 0, len(s))
+		for _, item := range s {
+			if str, ok := item.(string); ok {
+				out = append(out, str)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 // The official Anthropic SDK strictly separates the tool's Properties and Required fields into dedicated struct types
 func (p *ClaudeProvider) Generate(ctx context.Context, msgs []schema.Message, availTools []schema.ToolDefinition) (*schema.Message, error) {
 	var anthropicMsgs []anthropic.MessageParam
@@ -75,16 +95,21 @@ func (p *ClaudeProvider) Generate(ctx context.Context, msgs []schema.Message, av
 		var properties map[string]any
 		var required []string
 
-		// Try direct type assertion first; if it fails, fall back to JSON round-trip serialization to ensure type matching
-		if m, ok := toolDef.InputSchema.(map[string]any); ok {
-			if p, ok := m["properties"].(map[string]any); ok {
-				properties = p
-			}
-			if r, ok := m["required"].([]string); ok {
-				required = r
-			}
-
+		// Normalize the schema into a map[string]any first. A direct assertion
+		// only works for locally-defined tools; MCP tools (and any schema that
+		// has been JSON round-tripped) arrive as map[string]interface{} with
+		// required as []interface{}, so we fall back to a JSON round-trip and
+		// then read the fields type-tolerantly.
+		m, ok := toolDef.InputSchema.(map[string]any)
+		if !ok {
+			b, _ := json.Marshal(toolDef.InputSchema)
+			_ = json.Unmarshal(b, &m)
 		}
+
+		if p, ok := m["properties"].(map[string]any); ok {
+			properties = p
+		}
+		required = toStringSlice(m["required"])
 
 		tp := anthropic.ToolParam{
 			Name:        toolDef.Name,
